@@ -1,0 +1,14 @@
+---
+source: tests/cli_json.rs
+expression: "String::from_utf8(output.stdout).unwrap()"
+---
+Upload a local file
+
+Usage: gfile upload [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>  File to upload
+
+Options:
+  -v, --verbose...  Increase logging verbosity (-v for info, -vv for debug)
+  -h, --help        Print help

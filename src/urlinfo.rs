@@ -21,9 +21,26 @@ pub struct UrlInfo {
 
 impl UrlInfo {
     pub fn download_url(&self) -> String {
+        self.download_url_for(&self.file_id, None)
+    }
+
+    pub fn download_url_for(&self, file_id: &str, key: Option<&str>) -> String {
+        let mut url = Url::parse(&format!("{}/download.php", self.origin))
+            .expect("validated origin must form a valid download endpoint");
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("file", file_id);
+            if let Some(key) = key {
+                query.append_pair("dlkey", key);
+            }
+        }
+        url.to_string()
+    }
+
+    pub fn legacy_download_url_for(&self, file_id: &str) -> String {
         format!(
             "{}{}{}",
-            self.origin, DOWNLOAD_ENDPOINT_WITH_FILE_PARAM, self.file_id
+            self.origin, DOWNLOAD_ENDPOINT_WITH_FILE_PARAM, file_id
         )
     }
 }
@@ -98,6 +115,10 @@ mod tests {
         assert_eq!(
             info.download_url(),
             "https://23.gigafile.nu/download.php?file=0123abcd-000000example"
+        );
+        assert_eq!(
+            info.download_url_for("0123abcd-000000example-2", Some("EXAMPLE-KEY-0000")),
+            "https://23.gigafile.nu/download.php?file=0123abcd-000000example-2&dlkey=EXAMPLE-KEY-0000"
         );
     }
 

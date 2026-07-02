@@ -1,0 +1,10 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "code": "password_wrong",
+  "exit_code": 16,
+  "message": "The download key was rejected. Check the key and remember that it is case-sensitive.",
+  "status": "error"
+}

@@ -11,13 +11,13 @@ use std::{
 };
 
 use gfile_rust::{
-    download::{DownloadOptions, download},
+    download::{DownloadOptions, DownloadReport, download},
     error::GfileError,
 };
 use tempfile::TempDir;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{header, method, path, query_param},
 };
 
 const FILE_ID: &str = "0123abcd-000000example";
@@ -30,22 +30,77 @@ async fn download_single_success_writes_final_and_cleans_part_files() {
     mount_file(&server, 200, body.clone(), Some(body.len()), None).await;
     let temp = TempDir::new().unwrap();
 
-    let outcome = download(options(&server, &temp, 3)).await.unwrap();
+    let report = download(options(&server, &temp, 3)).await.unwrap();
+    let outcome = only_file(&report);
 
-    assert_eq!(outcome.bytes, body.len() as u64);
-    assert_eq!(std::fs::read(&outcome.path).unwrap(), body);
+    assert_eq!(outcome.bytes, Some(body.len() as u64));
+    assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
     assert!(
         !outcome
             .path
+            .as_ref()
+            .unwrap()
             .with_file_name("example file.bin.part")
             .exists()
     );
     assert!(
         !outcome
             .path
+            .as_ref()
+            .unwrap()
             .with_file_name("example file.bin.part.json")
             .exists()
     );
+}
+
+#[tokio::test]
+async fn download_password_file_requires_key_and_sends_dlkey() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(512);
+    let success_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "dlkey" && value == "EXAMPLE-KEY-0000")
+            {
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", success_body.len().to_string())
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(success_body.clone())
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_raw(include_str!("fixtures/page_needs_key.html"), "text/html")
+            }
+        })
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+
+    let error = download(options(&server, &temp, 0))
+        .await
+        .expect_err("missing key should fail");
+    assert!(matches!(error, GfileError::KeyRequired));
+
+    let mut opts = options(&server, &temp, 0);
+    opts.key = Some("EXAMPLE-KEY-0000".to_owned());
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(outcome.bytes, Some(body.len() as u64));
+    assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.url.path() == "/download.php"
+            && request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "dlkey" && value == "EXAMPLE-KEY-0000")
+    }));
 }
 
 #[tokio::test]
@@ -56,17 +111,60 @@ async fn download_single_japanese_name_preserves_filename_bytes() {
     mount_file(&server, 200, body, Some(1024), None).await;
     let temp = TempDir::new().unwrap();
 
-    let outcome = download(options(&server, &temp, 3)).await.unwrap();
+    let report = download(options(&server, &temp, 3)).await.unwrap();
+    let outcome = only_file(&report);
 
     assert_eq!(
         outcome
             .path
+            .as_ref()
+            .unwrap()
             .file_name()
             .unwrap()
             .to_string_lossy()
             .as_bytes(),
         "テスト資料_2026.zip".as_bytes()
     );
+}
+
+#[tokio::test]
+async fn download_content_disposition_overrides_masked_page_name() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_masked.html")).await;
+    let body = binary_body(4096);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", body.len().to_string())
+                .insert_header("Content-Type", "application/octet-stream")
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"fallback.bin\"; filename*=UTF-8''%E3%83%86%E3%82%B9%E3%83%88%E8%B3%87%E6%96%99_2026.bin",
+                )
+                .set_body_bytes(body),
+        )
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+
+    let report = download(options(&server, &temp, 3)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(outcome.name.as_bytes(), "テスト資料_2026.bin".as_bytes());
+    assert_eq!(
+        outcome
+            .path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+        "テスト資料_2026.bin".as_bytes()
+    );
+    assert!(!temp.path().join("______.bin").exists());
 }
 
 #[tokio::test]
@@ -88,6 +186,8 @@ async fn download_size_mismatch_keeps_part_file() {
         retries: 0,
         user_agent: None,
         dump_page: None,
+        no_resume: false,
+        key: None,
         quiet: true,
         allow_any_host: true,
     };
@@ -154,9 +254,10 @@ async fn download_retries_503_then_succeeds() {
         .await;
     let temp = TempDir::new().unwrap();
 
-    let outcome = download(options(&server, &temp, 3)).await.unwrap();
+    let report = download(options(&server, &temp, 3)).await.unwrap();
+    let outcome = only_file(&report);
 
-    assert_eq!(outcome.bytes, 4096);
+    assert_eq!(outcome.bytes, Some(4096));
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
 
@@ -193,10 +294,184 @@ async fn download_without_content_length_succeeds() {
     mount_file(&server, 200, body, None, None).await;
     let temp = TempDir::new().unwrap();
 
-    let outcome = download(options(&server, &temp, 0)).await.unwrap();
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
 
-    assert_eq!(outcome.bytes, 2048);
-    assert!(outcome.path.exists());
+    assert_eq!(outcome.bytes, Some(2048));
+    assert!(outcome.path.as_ref().unwrap().exists());
+}
+
+#[tokio::test]
+async fn download_resume_206_appends_and_marks_resumed() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"hello").unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(10), false);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .and(header("Range", "bytes=5-"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 5-9/10")
+                .insert_header("Content-Length", "5")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"world".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
+    assert!(outcome.resumed);
+    assert_eq!(outcome.bytes, Some(10));
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+}
+
+#[tokio::test]
+async fn download_resume_200_truncates_and_redownloads() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"hello").unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(10), false);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "10")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"helloworld".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
+    assert!(!outcome.resumed);
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+}
+
+#[tokio::test]
+async fn download_resume_416_promotes_completed_part() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"helloworld").unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(10), false);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .and(header("Range", "bytes=10-"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
+    assert!(outcome.resumed);
+    assert_eq!(outcome.bytes, Some(10));
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+}
+
+#[tokio::test]
+async fn download_bad_sidecar_restarts_from_zero_without_range() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"old").unwrap();
+    std::fs::write(&sidecar_path, b"not json").unwrap();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "10")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"helloworld".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
+    assert!(!outcome.resumed);
+    let requests = server.received_requests().await.unwrap();
+    let file_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/download.php")
+        .unwrap();
+    assert!(file_request.headers.get("range").is_none());
+}
+
+#[tokio::test]
+async fn download_matomete_continues_after_failure_and_keeps_serial_order() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/matomete_two_files.html")).await;
+    let order = Arc::new(AtomicUsize::new(0));
+    let first_order = Arc::clone(&order);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |_request: &Request| {
+            assert_eq!(first_order.fetch_add(1, Ordering::SeqCst), 0);
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "5")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"first".to_vec())
+        })
+        .mount(&server)
+        .await;
+    let second_order = Arc::clone(&order);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", "0123abcd-000000example-2"))
+        .respond_with(move |_request: &Request| {
+            assert_eq!(second_order.fetch_add(1, Ordering::SeqCst), 1);
+            ResponseTemplate::new(503)
+        })
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let mut opts = options(&server, &temp, 0);
+    opts.output = Some(temp.path().to_owned());
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.first_failure_exit_code(), Some(12));
+    assert_eq!(
+        std::fs::read(temp.path().join("example file.bin")).unwrap(),
+        b"first"
+    );
+    assert!(!temp.path().join("example second.bin").exists());
+    assert_eq!(order.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -226,9 +501,10 @@ async fn download_stall_timeout_retries_and_succeeds() {
     let mut opts = options(&server, &temp, 1);
     opts.timeout = Duration::from_secs(1);
 
-    let outcome = download(opts).await.unwrap();
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
 
-    assert_eq!(outcome.bytes, 1024);
+    assert_eq!(outcome.bytes, Some(1024));
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
 
@@ -267,6 +543,8 @@ fn options(server: &MockServer, temp: &TempDir, retries: u32) -> DownloadOptions
         url: format!("{}/{FILE_ID}", server.uri()),
         output: Some(temp.path().to_owned()),
         force: false,
+        no_resume: false,
+        key: None,
         timeout: Duration::from_secs(60),
         retries,
         user_agent: None,
@@ -276,8 +554,28 @@ fn options(server: &MockServer, temp: &TempDir, retries: u32) -> DownloadOptions
     }
 }
 
+fn only_file(report: &DownloadReport) -> &gfile_rust::download::DownloadFileRecord {
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.failed, 0);
+    &report.files[0]
+}
+
 fn binary_body(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+fn write_sidecar(path: &std::path::Path, file_id: &str, expected: Option<u64>, key_used: bool) {
+    std::fs::write(
+        path,
+        serde_json::json!({
+            "version": 1,
+            "file_id": file_id,
+            "expected": expected,
+            "key_used": key_used
+        })
+        .to_string(),
+    )
+    .unwrap();
 }
 
 fn start_raw_mismatch_server(

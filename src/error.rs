@@ -13,6 +13,9 @@ pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 #[derive(Debug, Error)]
 pub enum GfileError {
+    #[error("usage error")]
+    Usage { message: String },
+
     #[error("invalid GigaFile URL")]
     InvalidUrl { url: String },
 
@@ -81,6 +84,7 @@ impl fmt::Display for IoOp {
 impl GfileError {
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::Usage { .. } => 2,
             Self::InvalidUrl { .. } => 10,
             Self::Network { .. } => 11,
             Self::HttpStatus { .. } => 12,
@@ -95,8 +99,26 @@ impl GfileError {
         }
     }
 
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Usage { .. } => "usage",
+            Self::InvalidUrl { .. } => "invalid_url",
+            Self::Network { .. } => "network",
+            Self::HttpStatus { .. } => "http_status",
+            Self::Parse { .. } => "parse",
+            Self::NotFoundOrExpired => "not_found_or_expired",
+            Self::KeyRequired => "key_required",
+            Self::KeyWrong => "password_wrong",
+            Self::SizeMismatch { .. } => "size_mismatch",
+            Self::Io { .. } => "io",
+            Self::UploadRejected { .. } => "upload_rejected",
+            Self::VerifyFailed { .. } => "verify_failed",
+        }
+    }
+
     pub fn user_message(&self) -> String {
         match self {
+            Self::Usage { message } => sanitize_message(message),
             Self::InvalidUrl { .. } => concat!(
                 "The URL is not a supported GigaFile download URL. ",
                 "Check that it is a public file page URL and try again."
@@ -200,6 +222,12 @@ mod tests {
 
     fn error_cases() -> Vec<(GfileError, u8)> {
         vec![
+            (
+                GfileError::Usage {
+                    message: "output must be a directory for matomete pages".to_owned(),
+                },
+                2,
+            ),
             (
                 GfileError::InvalidUrl {
                     url: "https://23.gigafile.nu/0123abcd-000000example?dlkey=EXAMPLE-KEY-0000"

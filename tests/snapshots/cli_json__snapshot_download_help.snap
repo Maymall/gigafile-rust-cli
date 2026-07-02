@@ -1,0 +1,24 @@
+---
+source: tests/cli_json.rs
+expression: stdout
+---
+Download a file from a public GigaFile page
+
+Usage: gfile download [OPTIONS] <URL>
+
+Arguments:
+  <URL>  Download page URL
+
+Options:
+  -o, --output <OUTPUT>          Output directory or explicit output file path
+  -v, --verbose...               Increase logging verbosity (-v for info, -vv for debug)
+  -k, --key <KEY>                Download key [aliases: --password]
+      --force                    Overwrite the final output file if it already exists
+      --no-resume                Ignore an existing .part file and start from zero
+      --timeout <TIMEOUT>        Per-read stall timeout in seconds [default: 60]
+      --retries <RETRIES>        Retry count for retryable network/server failures [default: 3]
+      --user-agent <USER_AGENT>  Override the default User-Agent
+      --dump-page <DUMP_PAGE>    Save the fetched download page HTML for diagnostics
+      --json                     Print one JSON object and disable progress output
+  -q, --quiet                    Disable progress and non-error status output
+  -h, --help                     Print help

@@ -1,0 +1,10 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "code": "parse",
+  "exit_code": 13,
+  "message": "The page could not be parsed: missing #dl. Page structure may have changed; rerun with --dump-page and -vv, then report the fixture.",
+  "status": "error"
+}

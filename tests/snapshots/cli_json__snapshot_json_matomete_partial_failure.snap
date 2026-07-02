@@ -1,0 +1,29 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "failed": 1,
+  "files": [
+    {
+      "bytes": 5,
+      "error": null,
+      "name": "example file.bin",
+      "path": "<PATH>",
+      "resumed": false
+    },
+    {
+      "bytes": null,
+      "error": {
+        "code": "http_status",
+        "exit_code": 12,
+        "message": "The server returned unexpected HTTP status 503. Try again later or rerun with -vv for diagnostics."
+      },
+      "name": "example second.bin",
+      "path": "<PATH>",
+      "resumed": false
+    }
+  ],
+  "kind": "matomete",
+  "status": "ok"
+}

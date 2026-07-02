@@ -106,6 +106,57 @@ async fn cli_download_existing_target_without_force_exits_18() {
         .stderr(predicate::str::contains("target exists"));
 }
 
+#[tokio::test]
+async fn cli_download_key_required_page_without_key_exits_15() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/page_needs_key.html")).await;
+    let temp = TempDir::new().unwrap();
+
+    Command::cargo_bin("gfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
+        .arg(temp.path())
+        .assert()
+        .code(15)
+        .stderr(predicate::str::contains("requires a download key"));
+}
+
+#[tokio::test]
+async fn cli_download_notfound_page_exits_14() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/page_notfound.html")).await;
+    let temp = TempDir::new().unwrap();
+
+    Command::cargo_bin("gfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
+        .arg(temp.path())
+        .assert()
+        .code(14)
+        .stderr(predicate::str::contains("not found or has expired"));
+}
+
+#[tokio::test]
+async fn cli_download_matomete_output_file_exits_2() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/matomete_two_files.html")).await;
+    let temp = TempDir::new().unwrap();
+    let output_file = temp.path().join("bundle.bin");
+
+    Command::cargo_bin("gfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
+        .arg(output_file)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "matomete downloads require --output",
+        ));
+}
+
 async fn mount_page(server: &MockServer, body: &'static str) {
     Mock::given(method("GET"))
         .and(path(format!("/{FILE_ID}")))

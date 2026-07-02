@@ -1,0 +1,18 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "failed": 0,
+  "files": [
+    {
+      "bytes": 5,
+      "error": null,
+      "name": "example file.bin",
+      "path": "<PATH>",
+      "resumed": false
+    }
+  ],
+  "kind": "single",
+  "status": "ok"
+}

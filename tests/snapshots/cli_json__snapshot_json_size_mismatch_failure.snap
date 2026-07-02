@@ -1,0 +1,10 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "code": "size_mismatch",
+  "exit_code": 17,
+  "message": "The downloaded size did not match the server header: expected 10 bytes, got 5 bytes. Keep the .part file for diagnostics or retry the download.",
+  "status": "error"
+}
