@@ -1,0 +1,27 @@
+# Rust/build output
+/target/
+
+# Local handoff, investigation, and planning material.
+# These are for Claude/Codex coordination on this machine, not repository content.
+/INVESTIGATION.md
+/LOCAL_NOTES.md
+/HANDOFF*.md
+/PROMPT*.md
+/PLAN*.md
+/CLAUDE*.md
+/.claude/
+/docs/IMPLEMENTATION_PLAN.md
+/docs/TEST_PLAN.md
+/docs/LIVE_TEST_NOTES.md
+/docs/*HANDOFF*.md
+/docs/*INVESTIGATION*.md
+/docs/*PROMPT*.md
+
+# Live-test and download artifacts
+/downloads/
+/tmp/
+/fixtures/live/
+*.dl
+*.part
+*.download
+*.tmp
