@@ -25,7 +25,7 @@ fn snapshot_gfile_help() {
         .unwrap();
 
     assert!(output.status.success());
-    insta::assert_snapshot!(String::from_utf8(output.stdout).unwrap());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn snapshot_download_help() {
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = normalize_help(&output.stdout);
     assert!(!stdout.contains("GFILE_TEST_ALLOW_ANY_HOST"));
     assert!(!stdout.contains("GFILE_TEST_ENTRY_URL"));
     insta::assert_snapshot!(stdout);
@@ -52,7 +52,7 @@ fn snapshot_upload_help() {
         .unwrap();
 
     assert!(output.status.success());
-    insta::assert_snapshot!(String::from_utf8(output.stdout).unwrap());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
 }
 
 #[tokio::test]
@@ -220,6 +220,12 @@ fn normalize_json(bytes: &[u8]) -> String {
     let mut value: Value = serde_json::from_slice(bytes).unwrap();
     redact_paths(&mut value);
     serde_json::to_string_pretty(&value).unwrap()
+}
+
+fn normalize_help(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace("gfile.exe", "gfile")
 }
 
 fn redact_paths(value: &mut Value) {
