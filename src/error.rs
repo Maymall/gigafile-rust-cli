@@ -53,7 +53,11 @@ pub enum GfileError {
     },
 
     #[error("upload rejected")]
-    UploadRejected { detail: String },
+    UploadRejected {
+        detail: String,
+        status: Option<u16>,
+        retryable: bool,
+    },
 
     #[error("upload verification failed: expected {expected} bytes, got {actual} bytes")]
     VerifyFailed { expected: u64, actual: u64 },
@@ -155,7 +159,7 @@ impl GfileError {
                 "The downloaded size did not match the server header: expected {expected} bytes, got {actual} bytes. Keep the .part file for diagnostics or retry the download."
             ),
             Self::Io { source, path, op } => io_message(source, path, *op),
-            Self::UploadRejected { detail } => format!(
+            Self::UploadRejected { detail, .. } => format!(
                 "The upload was rejected: {}. Retry later; if it keeps failing, rerun with -vv and report the response details.",
                 sanitize_message(detail)
             ),
@@ -279,6 +283,8 @@ mod tests {
             (
                 GfileError::UploadRejected {
                     detail: "not implemented".to_owned(),
+                    status: None,
+                    retryable: false,
                 },
                 19,
             ),

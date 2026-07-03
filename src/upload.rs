@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
+    future::Future,
     io,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
+use futures_util::TryStreamExt;
 use reqwest::{Method, StatusCode, header, multipart};
 use serde_json::Value;
 use tokio::{
@@ -104,6 +110,50 @@ struct FilePlan {
     chunks: Vec<ChunkPlan>,
 }
 
+#[derive(Debug)]
+struct UploadActivity {
+    last: Mutex<Instant>,
+}
+
+struct ChunkUploadContext<'a> {
+    client: &'a reqwest::Client,
+    endpoint: &'a str,
+    file_plan: &'a FilePlan,
+    chunks: u64,
+    upload_id: &'a str,
+    options: &'a UploadOptions,
+    progress: &'a ByteProgress,
+}
+
+impl UploadActivity {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn mark(&self) {
+        *self.last.lock().expect("upload activity mutex poisoned") = Instant::now();
+    }
+
+    fn remaining_before_idle_timeout(&self, timeout: Duration) -> Duration {
+        let elapsed = self
+            .last
+            .lock()
+            .expect("upload activity mutex poisoned")
+            .elapsed();
+        timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO)
+    }
+
+    fn is_idle_for_at_least(&self, timeout: Duration) -> bool {
+        self.last
+            .lock()
+            .expect("upload activity mutex poisoned")
+            .elapsed()
+            >= timeout
+    }
+}
+
 pub fn default_entry_url() -> &'static str {
     DEFAULT_ENTRY_URL
 }
@@ -160,18 +210,19 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
     let upload_id = Uuid::new_v4().simple().to_string();
     let progress = ByteProgress::new(Some(file_plan.size), options.quiet, &file_plan.file_name);
     let mut uploaded_url = None;
+    let mut confirmed_bytes = 0;
+    let chunk_context = ChunkUploadContext {
+        client: &client,
+        endpoint: &endpoint,
+        file_plan: &file_plan,
+        chunks: file_plan.chunks.len() as u64,
+        upload_id: &upload_id,
+        options: &options,
+        progress: &progress,
+    };
 
     for chunk in &file_plan.chunks {
-        let response = send_chunk_with_retries(
-            &client,
-            &endpoint,
-            &file_plan,
-            *chunk,
-            file_plan.chunks.len() as u64,
-            &upload_id,
-            &options,
-        )
-        .await?;
+        let response = send_chunk_with_retries(&chunk_context, *chunk, confirmed_bytes).await?;
         if let Some(status) = response.get("status") {
             debug!(?status, chunk = chunk.index, "upload chunk status field");
         }
@@ -183,10 +234,13 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
             if uploaded_url.is_none() {
                 return Err(GfileError::UploadRejected {
                     detail: "final upload response did not contain a download URL; re-upload the whole file".to_owned(),
+                    status: None,
+                    retryable: false,
                 });
             }
         }
-        progress.inc(chunk.len);
+        confirmed_bytes += chunk.len;
+        progress.set_position(confirmed_bytes);
     }
     progress.finish();
 
@@ -285,23 +339,17 @@ fn chunk_plans(size: u64, chunk_size: u64) -> Vec<ChunkPlan> {
 }
 
 async fn send_chunk_with_retries(
-    client: &reqwest::Client,
-    endpoint: &str,
-    file_plan: &FilePlan,
+    context: &ChunkUploadContext<'_>,
     chunk: ChunkPlan,
-    chunks: u64,
-    upload_id: &str,
-    options: &UploadOptions,
+    confirmed_bytes: u64,
 ) -> Result<Value, GfileError> {
     let mut attempt = 0;
     loop {
-        match send_chunk_once(
-            client, endpoint, file_plan, chunk, chunks, upload_id, options,
-        )
-        .await
-        {
+        context.progress.set_position(confirmed_bytes);
+        match send_chunk_once(context, chunk, confirmed_bytes).await {
             Ok(value) => return Ok(value),
-            Err(error) if upload_retryable(&error) && attempt < options.retries => {
+            Err(error) if upload_retryable(&error) && attempt < context.options.retries => {
+                context.progress.set_position(confirmed_bytes);
                 warn!(
                     "retrying upload chunk {} after error: {}",
                     chunk.index,
@@ -310,61 +358,80 @@ async fn send_chunk_with_retries(
                 tokio::time::sleep(http::retry_delay(attempt)).await;
                 attempt += 1;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                context.progress.set_position(confirmed_bytes);
+                return Err(error);
+            }
         }
     }
 }
 
 async fn send_chunk_once(
-    client: &reqwest::Client,
-    endpoint: &str,
-    file_plan: &FilePlan,
+    context: &ChunkUploadContext<'_>,
     chunk: ChunkPlan,
-    chunks: u64,
-    upload_id: &str,
-    options: &UploadOptions,
+    confirmed_bytes: u64,
 ) -> Result<Value, GfileError> {
-    let mut file = File::open(&file_plan.path)
+    let mut file = File::open(&context.file_plan.path)
         .await
-        .map_err(|source| io_error(source, &file_plan.path, IoOp::Read))?;
+        .map_err(|source| io_error(source, &context.file_plan.path, IoOp::Read))?;
     file.seek(SeekFrom::Start(chunk.offset))
         .await
-        .map_err(|source| io_error(source, &file_plan.path, IoOp::Read))?;
+        .map_err(|source| io_error(source, &context.file_plan.path, IoOp::Read))?;
     let reader = file.take(chunk.len);
-    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
+    let activity = Arc::new(UploadActivity::new());
+    let sent_in_attempt = Arc::new(AtomicU64::new(0));
+    let activity_for_stream = Arc::clone(&activity);
+    let sent_for_stream = Arc::clone(&sent_in_attempt);
+    let progress_for_stream = context.progress.clone();
+    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE).map_ok(move |bytes| {
+        activity_for_stream.mark();
+        let sent =
+            sent_for_stream.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+        progress_for_stream.set_position(confirmed_bytes + sent);
+        bytes
+    });
     let body = reqwest::Body::wrap_stream(stream);
     let part = multipart::Part::stream_with_length(body, chunk.len)
         .file_name(FILE_PART_NAME)
         .mime_str(FILE_PART_MIME)
         .expect("valid multipart MIME type");
     let form = multipart::Form::new()
-        .text(FIELD_ID, upload_id.to_owned())
-        .text(FIELD_NAME, file_plan.file_name.clone())
+        .text(FIELD_ID, context.upload_id.to_owned())
+        .text(FIELD_NAME, context.file_plan.file_name.clone())
         .text(FIELD_CHUNK, chunk.index.to_string())
-        .text(FIELD_CHUNKS, chunks.to_string())
-        .text(FIELD_LIFETIME, options.lifetime.to_string())
+        .text(FIELD_CHUNKS, context.chunks.to_string())
+        .text(FIELD_LIFETIME, context.options.lifetime.to_string())
         .part(FIELD_FILE, part);
 
-    let request = client.post(endpoint).multipart(form).send();
-    let response = tokio::time::timeout(options.timeout, request)
-        .await
-        .map_err(|_| timeout_network_error("uploading chunk"))?
-        .map_err(|source| network_error(source, "uploading chunk"))?;
+    let request = context.client.post(context.endpoint).multipart(form).send();
+    let response = send_with_idle_timeout(
+        request,
+        activity,
+        context.options.timeout,
+        "uploading chunk",
+    )
+    .await?;
 
     if response.status().is_server_error() {
+        let status = response.status().as_u16();
         return Err(GfileError::UploadRejected {
             detail: format!(
                 "server returned HTTP {} for an upload chunk; re-upload the whole file",
-                response.status().as_u16()
+                status
             ),
+            status: Some(status),
+            retryable: true,
         });
     }
     if !response.status().is_success() {
+        let status = response.status().as_u16();
         return Err(GfileError::UploadRejected {
             detail: format!(
                 "server returned HTTP {} for an upload chunk; re-upload the whole file",
-                response.status().as_u16()
+                status
             ),
+            status: Some(status),
+            retryable: false,
         });
     }
 
@@ -375,7 +442,32 @@ async fn send_chunk_once(
             detail: format!(
                 "upload endpoint returned a non-JSON response ({source}); re-upload the whole file"
             ),
+            status: None,
+            retryable: false,
         })
+}
+
+async fn send_with_idle_timeout<F>(
+    request: F,
+    activity: Arc<UploadActivity>,
+    timeout: Duration,
+    context: &str,
+) -> Result<reqwest::Response, GfileError>
+where
+    F: Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    tokio::pin!(request);
+    loop {
+        let remaining = activity.remaining_before_idle_timeout(timeout);
+        tokio::select! {
+            result = &mut request => return result.map_err(|source| network_error(source, context)),
+            _ = tokio::time::sleep(remaining) => {
+                if activity.is_idle_for_at_least(timeout) {
+                    return Err(timeout_network_error(context));
+                }
+            }
+        }
+    }
 }
 
 async fn verify_uploaded_file(
@@ -551,7 +643,7 @@ fn validate_chunk_size(bytes: u64) -> Result<(), GfileError> {
 fn upload_retryable(error: &GfileError) -> bool {
     match error {
         GfileError::Network { .. } => true,
-        GfileError::UploadRejected { detail } => detail.contains("HTTP 5"),
+        GfileError::UploadRejected { retryable, .. } => *retryable,
         _ => false,
     }
 }

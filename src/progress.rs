@@ -4,6 +4,7 @@ use std::io::IsTerminal;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
+#[derive(Clone)]
 pub struct ByteProgress {
     bar: Option<ProgressBar>,
 }
@@ -33,6 +34,12 @@ impl ByteProgress {
     pub fn inc(&self, bytes: u64) {
         if let Some(bar) = &self.bar {
             bar.inc(bytes);
+        }
+    }
+
+    pub fn set_position(&self, bytes: u64) {
+        if let Some(bar) = &self.bar {
+            bar.set_position(bytes);
         }
     }
 

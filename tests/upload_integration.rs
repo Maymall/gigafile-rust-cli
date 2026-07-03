@@ -173,6 +173,34 @@ async fn upload_retries_5xx_then_succeeds() {
 }
 
 #[tokio::test]
+async fn upload_idle_timeout_retries_stalled_response_then_succeeds() {
+    let server = MockServer::start().await;
+    mount_landing(&server).await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let responder_counter = Arc::clone(&counter);
+    Mock::given(method("POST"))
+        .and(path("/upload_chunk.php"))
+        .respond_with(move |_request: &Request| {
+            let attempt = responder_counter.fetch_add(1, Ordering::SeqCst);
+            let response = ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "status": 0, "url": format!("http://example.invalid/{FILE_ID}") }));
+            if attempt == 0 {
+                response.set_delay(Duration::from_secs(2))
+            } else {
+                response
+            }
+        })
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let file = write_file(&temp, "idle-timeout.bin", b"hello");
+
+    upload(options(&server, file, true, 1)).await.unwrap();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn upload_does_not_retry_4xx_or_continue_later_chunks() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
