@@ -7,6 +7,12 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-04
+
+### Fixed
+
+- Send the `Range` request header title-cased (`Range:` instead of `range:`). GigaFile's server matches header names case-sensitively and silently ignores the lowercase form, answering `200 OK` instead of `206 Partial Content` — this made every resumed and segmented (`--threads`) download fall back to a single connection or restart from zero against the real server, even though it worked fine in local mock-based tests.
+
 ## [0.5.1] - 2026-07-03
 
 ### Fixed
