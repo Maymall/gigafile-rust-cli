@@ -210,6 +210,46 @@ async fn download_size_mismatch_keeps_part_file() {
 }
 
 #[tokio::test]
+async fn download_range_header_is_sent_title_cased_for_legacy_servers() {
+    // Live 2026-07-03: GigaFile matches header names case-sensitively and
+    // ignores hyper's default lowercase `range:`, replying 200 instead of 206.
+    let (server_uri, captured) = start_header_capture_server(
+        include_str!("fixtures/single_basic.html")
+            .as_bytes()
+            .to_vec(),
+        binary_body(2 * 1024),
+    );
+    let temp = TempDir::new().unwrap();
+    let opts = DownloadOptions {
+        url: format!("{server_uri}/{FILE_ID}"),
+        output: Some(temp.path().to_owned()),
+        force: false,
+        timeout: Duration::from_secs(60),
+        retries: 0,
+        user_agent: None,
+        dump_page: None,
+        no_resume: false,
+        key: None,
+        selection: None,
+        threads: 2,
+        quiet: true,
+        allow_any_host: true,
+    };
+
+    let _ = download(opts).await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        request.contains("\r\nRange: bytes=0-"),
+        "download request must send a title-cased Range header, got:\n{request}"
+    );
+    assert!(
+        !request.contains("\r\nrange:"),
+        "lowercase range header is ignored by the live server, got:\n{request}"
+    );
+}
+
+#[tokio::test]
 async fn download_html_response_is_not_written_to_disk() {
     let server = MockServer::start().await;
     mount_page(&server, include_str!("fixtures/single_basic.html")).await;
@@ -517,6 +557,179 @@ async fn download_threads_resumes_v2_sidecar_segments() {
         observed,
         vec![(ranges[1].0 + partial, ranges[1].1), ranges[2], ranges[3],]
     );
+    assert_eq!(non_range_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn download_threads_resume_all_partial_segments_offset_by_downloaded() {
+    // Every segment is partially downloaded (none `done`), matching the live
+    // regression where the bootstrap probe (segment 0) AND the worker segments
+    // all carry a nonzero `downloaded`. Each incomplete segment must resume at
+    // `start + downloaded`, never re-fetching bytes it already has.
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(64 * 1024);
+    let ranges = expected_ranges(body.len() as u64, 4);
+    let downloaded = [4096_u64, 8192, 2048, 1024];
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, vec![0_u8; body.len()]).unwrap();
+    for (range, done) in ranges.iter().zip(downloaded) {
+        write_body_range(&part_path, &body, range.0, range.0 + done - 1).unwrap();
+    }
+    write_segment_sidecar(
+        &sidecar_path,
+        FILE_ID,
+        body.len() as u64,
+        false,
+        &[
+            (ranges[0].0, ranges[0].1, false, downloaded[0]),
+            (ranges[1].0, ranges[1].1, false, downloaded[1]),
+            (ranges[2].0, ranges[2].1, false, downloaded[2]),
+            (ranges[3].0, ranges[3].1, false, downloaded[3]),
+        ],
+    );
+    let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+    let non_range_requests = Arc::new(AtomicUsize::new(0));
+    let responder_ranges = Arc::clone(&observed_ranges);
+    let responder_non_ranges = Arc::clone(&non_range_requests);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some((start, end)) = range_header(request) {
+                responder_ranges.lock().unwrap().push((start, end));
+                range_response(&responder_body, start, end)
+            } else {
+                responder_non_ranges.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut opts = options(&server, &temp, 0);
+    opts.threads = 4;
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert!(outcome.resumed);
+    assert_eq!(std::fs::read(&final_path).unwrap(), body);
+    let expected_offsets: Vec<(u64, u64)> = ranges
+        .iter()
+        .zip(downloaded)
+        .map(|(range, done)| (range.0 + done, range.1))
+        .collect();
+    let mut observed = observed_ranges.lock().unwrap().clone();
+    observed.sort_unstable();
+    assert_eq!(observed, expected_offsets);
+    // No request may re-fetch bytes below `start + downloaded` of any segment.
+    for (range, done) in ranges.iter().zip(downloaded) {
+        let resume_at = range.0 + done;
+        for (start, end) in observed.iter().copied() {
+            if start <= range.1 && end >= range.0 {
+                assert!(
+                    start >= resume_at,
+                    "segment {range:?} re-fetched from {start}, below resume point {resume_at}"
+                );
+            }
+        }
+    }
+    assert_eq!(non_range_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn download_threads_resume_completes_hash_without_underfetch() {
+    // Mixes a completed segment with partially-downloaded workers and a fresh
+    // worker, over a non-power-of-two length. A completed segment must not be
+    // re-requested; every other segment must resume at `start + downloaded`;
+    // the finished file must match the source hash bit-for-bit.
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(40_000);
+    let expected_hash = sha256_hex(&body);
+    let ranges = expected_ranges(body.len() as u64, 4);
+    // seg0 done, seg1/seg2 partial, seg3 untouched.
+    let downloaded = [
+        ranges[0].1 - ranges[0].0 + 1, // full
+        3000_u64,
+        100_u64,
+        0_u64,
+    ];
+    let done = [true, false, false, false];
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, vec![0_u8; body.len()]).unwrap();
+    for (range, got) in ranges.iter().zip(downloaded) {
+        if got > 0 {
+            write_body_range(&part_path, &body, range.0, range.0 + got - 1).unwrap();
+        }
+    }
+    write_segment_sidecar(
+        &sidecar_path,
+        FILE_ID,
+        body.len() as u64,
+        false,
+        &[
+            (ranges[0].0, ranges[0].1, done[0], downloaded[0]),
+            (ranges[1].0, ranges[1].1, done[1], downloaded[1]),
+            (ranges[2].0, ranges[2].1, done[2], downloaded[2]),
+            (ranges[3].0, ranges[3].1, done[3], downloaded[3]),
+        ],
+    );
+    let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+    let non_range_requests = Arc::new(AtomicUsize::new(0));
+    let responder_ranges = Arc::clone(&observed_ranges);
+    let responder_non_ranges = Arc::clone(&non_range_requests);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some((start, end)) = range_header(request) {
+                responder_ranges.lock().unwrap().push((start, end));
+                range_response(&responder_body, start, end)
+            } else {
+                responder_non_ranges.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut opts = options(&server, &temp, 0);
+    opts.threads = 4;
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert!(outcome.resumed);
+    let finished = std::fs::read(&final_path).unwrap();
+    assert_eq!(sha256_hex(&finished), expected_hash);
+    let observed = observed_ranges.lock().unwrap().clone();
+    // The completed segment must never be re-requested.
+    assert!(
+        !observed
+            .iter()
+            .any(|(start, _)| (ranges[0].0..=ranges[0].1).contains(start)),
+        "completed segment was re-requested: {observed:?}"
+    );
+    // No request may re-fetch bytes below `start + downloaded` of any segment.
+    for (range, got) in ranges.iter().zip(downloaded) {
+        let resume_at = range.0 + got;
+        for (start, end) in observed.iter().copied() {
+            if start <= range.1 && end >= range.0 {
+                assert!(
+                    start >= resume_at,
+                    "segment {range:?} re-fetched from {start}, below resume point {resume_at}"
+                );
+            }
+        }
+    }
     assert_eq!(non_range_requests.load(Ordering::SeqCst), 0);
 }
 
@@ -1357,6 +1570,36 @@ fn start_raw_mismatch_server(
         }
     });
     format!("http://{addr}")
+}
+
+fn start_header_capture_server(
+    page_body: Vec<u8>,
+    file_body: Vec<u8>,
+) -> (String, Arc<Mutex<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(String::new()));
+    let captured_writer = Arc::clone(&captured);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            if request.starts_with(&format!("GET /{FILE_ID} ")) {
+                write_response(&mut stream, "text/html", page_body.len(), &page_body);
+            } else {
+                *captured_writer.lock().unwrap() = request.clone();
+                write_response(
+                    &mut stream,
+                    "application/octet-stream",
+                    file_body.len(),
+                    &file_body,
+                );
+            }
+        }
+    });
+    (format!("http://{addr}"), captured)
 }
 
 fn write_response(stream: &mut std::net::TcpStream, content_type: &str, len: usize, body: &[u8]) {
