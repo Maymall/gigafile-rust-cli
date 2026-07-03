@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gfile_rust::{
+use rgfile::{
     error::GfileError,
     upload::{MIN_CHUNK_SIZE, UploadOptions, upload},
 };

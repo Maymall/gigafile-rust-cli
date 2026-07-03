@@ -1,7 +1,8 @@
 # NOTICE
 
-This project is a Rust rewrite derived from and substantially informed by the
-GPL-3.0 `gfile` implementations:
+rgfile (repository `gigafile-rust-cli`) is licensed under GPL-3.0-only. It is a
+Rust rewrite derived from and substantially informed by the GPL-3.0 `gfile`
+implementations:
 
 - `Sraq-Zit/gfile`, the original repository.
 - `fireattack/gfile`, the active fork and source of the PyPI package

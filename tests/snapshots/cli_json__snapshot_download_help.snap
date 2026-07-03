@@ -4,7 +4,7 @@ expression: stdout
 ---
 Download a file from a public GigaFile page
 
-Usage: gfile download [OPTIONS] <URL>
+Usage: rgfile download [OPTIONS] <URL>
 
 Arguments:
   <URL>  Download page URL

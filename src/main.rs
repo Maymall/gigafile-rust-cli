@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use gfile_rust::cli::{self, Cli, RunOutcome};
+use rgfile::cli::{self, Cli, RunOutcome};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {

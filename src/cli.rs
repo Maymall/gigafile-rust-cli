@@ -9,7 +9,7 @@ use crate::{download, error::GfileError, jsonout, upload};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "gfile",
+    name = "rgfile",
     version,
     about = "Upload and download GigaFile public web files",
     long_about = None
@@ -125,7 +125,7 @@ pub fn init_tracing(verbosity: u8) {
             1 => "info",
             _ => "debug",
         };
-        EnvFilter::new(format!("gfile_rust={level},gfile={level}"))
+        EnvFilter::new(format!("rgfile={level}"))
     });
 
     let _ = tracing_subscriber::fmt()

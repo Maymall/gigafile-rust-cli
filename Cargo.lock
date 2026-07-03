@@ -667,32 +667,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfile-rust"
-version = "0.3.0"
-dependencies = [
- "assert_cmd",
- "clap",
- "futures-util",
- "indicatif",
- "insta",
- "predicates",
- "regex",
- "reqwest",
- "rpassword",
- "scraper",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1606,6 +1580,32 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "rgfile"
+version = "0.3.1"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "futures-util",
+ "indicatif",
+ "insta",
+ "predicates",
+ "regex",
+ "reqwest",
+ "rpassword",
+ "scraper",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ const REDIRECT_LIMIT: usize = 5;
 
 pub fn default_user_agent() -> String {
     format!(
-        "gfile-rust/{} (+https://github.com/Maymall/gfile-rust)",
+        "rgfile/{} (+https://github.com/Maymall/gigafile-rust-cli)",
         env!("CARGO_PKG_VERSION")
     )
 }

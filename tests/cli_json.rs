@@ -17,8 +17,8 @@ use wiremock::{
 const FILE_ID: &str = "0123abcd-000000example";
 
 #[test]
-fn snapshot_gfile_help() {
-    let output = Command::cargo_bin("gfile")
+fn snapshot_rgfile_help() {
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .arg("--help")
         .output()
@@ -30,7 +30,7 @@ fn snapshot_gfile_help() {
 
 #[test]
 fn snapshot_download_help() {
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .args(["download", "--help"])
         .output()
@@ -45,7 +45,7 @@ fn snapshot_download_help() {
 
 #[test]
 fn snapshot_upload_help() {
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .args(["upload", "--help"])
         .output()
@@ -62,7 +62,7 @@ async fn snapshot_json_single_success() {
     mount_file(&server, FILE_ID, b"hello".to_vec(), 5, 200).await;
     let temp = TempDir::new().unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args([
@@ -101,7 +101,7 @@ async fn snapshot_json_matomete_partial_failure() {
     mount_file(&server, "0123abcd-000000example-2", Vec::new(), 0, 503).await;
     let temp = TempDir::new().unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args([
@@ -133,7 +133,7 @@ async fn snapshot_json_key_wrong_failure() {
         .await;
     let temp = TempDir::new().unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args([
@@ -163,7 +163,7 @@ fn snapshot_json_size_mismatch_failure() {
     );
     let temp = TempDir::new().unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args([
@@ -186,7 +186,7 @@ async fn snapshot_json_parse_failure() {
     mount_page(&server, include_str!("fixtures/single_broken.html")).await;
     let temp = TempDir::new().unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args([
@@ -229,7 +229,7 @@ async fn snapshot_json_upload_success() {
     let file = temp.path().join("upload.bin");
     std::fs::write(&file, b"hello").unwrap();
 
-    let output = Command::cargo_bin("gfile")
+    let output = Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .env("GFILE_TEST_ENTRY_URL", server.uri())
@@ -278,7 +278,7 @@ fn normalize_json(bytes: &[u8]) -> String {
 fn normalize_help(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec())
         .unwrap()
-        .replace("gfile.exe", "gfile")
+        .replace("rgfile.exe", "rgfile")
 }
 
 fn redact_paths(value: &mut Value) {

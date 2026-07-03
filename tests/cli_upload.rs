@@ -20,7 +20,7 @@ async fn cli_upload_success_prints_url() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "cli.bin", b"hello");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .env("GFILE_TEST_ENTRY_URL", server.uri())
@@ -42,7 +42,7 @@ async fn cli_upload_missing_url_exits_19() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "missing.bin", b"hello");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .env("GFILE_TEST_ENTRY_URL", server.uri())
@@ -68,7 +68,7 @@ async fn cli_upload_verify_mismatch_exits_20() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "mismatch.bin", b"hello");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .env("GFILE_TEST_ENTRY_URL", server.uri())
@@ -84,7 +84,7 @@ fn cli_upload_empty_file_exits_2() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "empty.bin", b"");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .args(["upload", "--no-verify"])
         .arg(file)
@@ -98,7 +98,7 @@ fn cli_upload_invalid_chunk_size_exits_2() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "chunk.bin", b"hello");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .args(["upload", "--chunk-size", "512K", "--no-verify"])
         .arg(file)

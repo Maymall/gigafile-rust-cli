@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/gfile${{ matrix.exe }}"
+          bin="target/${{ matrix.target }}/release/rgfile${{ matrix.exe }}"
           "$bin" --version
 
       - name: Package
@@ -77,9 +77,9 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           target="${{ matrix.target }}"
-          name="gfile-${version}-${target}"
+          name="rgfile-${version}-${target}"
           mkdir -p "dist/${name}"
-          cp "target/${target}/release/gfile${{ matrix.exe }}" "dist/${name}/"
+          cp "target/${target}/release/rgfile${{ matrix.exe }}" "dist/${name}/"
           cp LICENSE README.md NOTICE.md "dist/${name}/"
           cp NOTICE.md "dist/${name}/NOTICE"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
@@ -120,11 +120,11 @@ jobs:
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
 
           expected=(
-            "gfile-${version}-x86_64-unknown-linux-gnu.tar.gz"
-            "gfile-${version}-x86_64-unknown-linux-musl.tar.gz"
-            "gfile-${version}-aarch64-apple-darwin.tar.gz"
-            "gfile-${version}-x86_64-apple-darwin.tar.gz"
-            "gfile-${version}-x86_64-pc-windows-msvc.zip"
+            "rgfile-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "rgfile-${version}-x86_64-unknown-linux-musl.tar.gz"
+            "rgfile-${version}-aarch64-apple-darwin.tar.gz"
+            "rgfile-${version}-x86_64-apple-darwin.tar.gz"
+            "rgfile-${version}-x86_64-pc-windows-msvc.zip"
           )
           for asset in "${expected[@]}"; do
             test -f "release-assets/${asset}"
@@ -177,7 +177,7 @@ jobs:
             echo "Corresponding source is the repository content at:"
             echo "https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}"
             echo
-            echo "See NOTICE.md for GPL attribution to the upstream gfile implementations."
+            echo "See NOTICE.md for GPL attribution to the upstream Python gfile implementations."
           } > RELEASE_NOTES.md
 
       - name: Publish GitHub Release

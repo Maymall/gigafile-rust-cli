@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use gfile_rust::{
+use rgfile::{
     error::GfileError,
     parser::download::{
         PageKind, PageState, classify_page, parse_download_page, parse_single_file_page,

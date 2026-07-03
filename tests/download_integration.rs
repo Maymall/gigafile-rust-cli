@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use gfile_rust::{
+use rgfile::{
     download::{DownloadOptions, DownloadReport, download},
     error::GfileError,
 };
@@ -558,7 +558,7 @@ fn options(server: &MockServer, temp: &TempDir, retries: u32) -> DownloadOptions
     }
 }
 
-fn only_file(report: &DownloadReport) -> &gfile_rust::download::DownloadFileRecord {
+fn only_file(report: &DownloadReport) -> &rgfile::download::DownloadFileRecord {
     assert_eq!(report.files.len(), 1);
     assert_eq!(report.failed, 0);
     &report.files[0]

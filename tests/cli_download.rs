@@ -23,7 +23,7 @@ async fn cli_download_success_writes_file() {
     mount_file(&server, binary_body(1024), Some(1024)).await;
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
@@ -42,7 +42,7 @@ async fn cli_download_success_writes_file() {
 
 #[test]
 fn cli_download_invalid_url_exits_10() {
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .args(["download", "http://23.gigafile.nu/0123abcd-000000example"])
         .assert()
@@ -58,7 +58,7 @@ async fn cli_download_parse_error_exits_13() {
     mount_page(&server, include_str!("fixtures/single_broken.html")).await;
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
@@ -79,7 +79,7 @@ fn cli_download_size_mismatch_exits_17() {
     );
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{server_uri}/{FILE_ID}"), "-o"])
@@ -96,7 +96,7 @@ async fn cli_download_existing_target_without_force_exits_18() {
     let temp = TempDir::new().unwrap();
     std::fs::write(temp.path().join("example file.bin"), b"existing").unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
@@ -112,7 +112,7 @@ async fn cli_download_key_required_page_without_key_exits_15() {
     mount_page(&server, include_str!("fixtures/page_needs_key.html")).await;
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
@@ -128,7 +128,7 @@ async fn cli_download_notfound_page_exits_14() {
     mount_page(&server, include_str!("fixtures/page_notfound.html")).await;
     let temp = TempDir::new().unwrap();
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])
@@ -145,7 +145,7 @@ async fn cli_download_matomete_output_file_exits_2() {
     let temp = TempDir::new().unwrap();
     let output_file = temp.path().join("bundle.bin");
 
-    Command::cargo_bin("gfile")
+    Command::cargo_bin("rgfile")
         .unwrap()
         .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
         .args(["download", &format!("{}/{FILE_ID}", server.uri()), "-o"])

@@ -1,18 +1,18 @@
 [package]
-name = "gfile-rust"
-version = "0.3.0"
+name = "rgfile"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-only"
-repository = "https://github.com/Maymall/gfile-rust"
+repository = "https://github.com/Maymall/gigafile-rust-cli"
 description = "A conservative Rust CLI for GigaFile public web uploads and downloads."
 
 [lib]
-name = "gfile_rust"
+name = "rgfile"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gfile"
+name = "rgfile"
 path = "src/main.rs"
 
 [dependencies]

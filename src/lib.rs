@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Library entry points for the `gfile` command line tool.
+//! Library entry points for the `rgfile` command line tool.
 
 pub mod cli;
 pub mod download;
