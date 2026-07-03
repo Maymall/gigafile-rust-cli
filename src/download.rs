@@ -3,6 +3,7 @@
 use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -11,7 +12,7 @@ use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncWriteExt, BufWriter},
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom},
 };
 use tracing::{info, warn};
 
@@ -27,6 +28,10 @@ use crate::{
     urlinfo::parse_download_url,
 };
 
+pub const DEFAULT_DOWNLOAD_THREADS: u8 = 1;
+pub const MIN_DOWNLOAD_THREADS: u8 = 1;
+pub const MAX_DOWNLOAD_THREADS: u8 = 16;
+
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
     pub url: String,
@@ -34,6 +39,7 @@ pub struct DownloadOptions {
     pub force: bool,
     pub no_resume: bool,
     pub key: Option<String>,
+    pub threads: u8,
     pub timeout: Duration,
     pub retries: u32,
     pub user_agent: Option<String>,
@@ -62,6 +68,7 @@ pub struct DownloadFileRecord {
     pub path: Option<PathBuf>,
     pub bytes: Option<u64>,
     pub resumed: bool,
+    pub threads: Option<u8>,
     pub error: Option<ErrorJson>,
 }
 
@@ -71,6 +78,7 @@ struct SingleDownloadOutcome {
     path: PathBuf,
     bytes: u64,
     resumed: bool,
+    threads: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +87,39 @@ struct PartSidecar {
     file_id: String,
     expected: Option<u64>,
     key_used: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SegmentSidecar {
+    version: u8,
+    file_id: String,
+    expected: u64,
+    key_used: bool,
+    segments: Vec<SegmentState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SegmentState {
+    start: u64,
+    end: u64,
+    done: bool,
+    #[serde(default)]
+    downloaded: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentResumePlan {
+    part_path: PathBuf,
+    sidecar_path: PathBuf,
+    segments: Vec<SegmentState>,
+    resumed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentedDownloadPlan {
+    expected: u64,
+    header_name: Option<String>,
+    resume: SegmentResumePlan,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +141,40 @@ struct TransferPlan {
 #[derive(Debug, Clone, Copy)]
 struct ContentRange {
     start: u64,
+    end: u64,
     total: Option<u64>,
+}
+
+#[derive(Debug)]
+enum SegmentDownloadError {
+    Fallback(String),
+    Failed(GfileError),
+}
+
+#[derive(Clone)]
+struct SegmentContext {
+    client: reqwest::Client,
+    download_url: String,
+    part_path: PathBuf,
+    sidecar_path: PathBuf,
+    file_id: String,
+    expected: u64,
+    key_used: bool,
+    timeout: Duration,
+    progress: ByteProgress,
+    shared_segments: Arc<Mutex<Vec<SegmentState>>>,
+}
+
+pub fn validate_threads(threads: u8) -> Result<u8, GfileError> {
+    if (MIN_DOWNLOAD_THREADS..=MAX_DOWNLOAD_THREADS).contains(&threads) {
+        Ok(threads)
+    } else {
+        Err(GfileError::Usage {
+            message: format!(
+                "download threads must be between {MIN_DOWNLOAD_THREADS} and {MAX_DOWNLOAD_THREADS}, got {threads}"
+            ),
+        })
+    }
 }
 
 pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, GfileError> {
@@ -184,6 +258,7 @@ pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, Gf
                 path: Some(outcome.path),
                 bytes: Some(outcome.bytes),
                 resumed: outcome.resumed,
+                threads: Some(outcome.threads),
                 error: None,
             }),
             Err(error) if page.kind == PageKind::Single => return Err(error),
@@ -227,6 +302,7 @@ fn record_error(
         path,
         bytes: None,
         resumed: false,
+        threads: None,
         error: Some(json_error),
     });
 }
@@ -256,6 +332,27 @@ async fn download_file_with_retries(
 }
 
 async fn try_download_file(
+    client: &reqwest::Client,
+    download_url: &str,
+    remote_file: &RemoteFile,
+    final_path: &Path,
+    options: &DownloadOptions,
+) -> Result<SingleDownloadOutcome, GfileError> {
+    if options.threads > DEFAULT_DOWNLOAD_THREADS {
+        return try_download_file_segmented_or_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+        )
+        .await;
+    }
+
+    try_download_file_sequential(client, download_url, remote_file, final_path, options).await
+}
+
+async fn try_download_file_sequential(
     client: &reqwest::Client,
     download_url: &str,
     remote_file: &RemoteFile,
@@ -441,7 +538,659 @@ async fn try_download_file(
         path: target_path,
         bytes: actual,
         resumed: transfer.resumed,
+        threads: DEFAULT_DOWNLOAD_THREADS,
     })
+}
+
+async fn try_download_file_segmented_or_fallback(
+    client: &reqwest::Client,
+    download_url: &str,
+    remote_file: &RemoteFile,
+    final_path: &Path,
+    options: &DownloadOptions,
+) -> Result<SingleDownloadOutcome, GfileError> {
+    let mut target_path = final_path.to_owned();
+    let header_output_dir = header_filename_output_dir(final_path, options.output.as_deref())?;
+    let response = send_download_request(client, download_url, None, options).await?;
+
+    if !response.status().is_success() {
+        return Err(http::status_error(response.status(), download_url));
+    }
+
+    if is_html_content_type(response.headers()) {
+        let body = response
+            .text()
+            .await
+            .map_err(|source| network_error(source, "reading HTML download error body"))?;
+        return Err(classify_html_response(
+            &body,
+            options.key.is_some(),
+            "download response content-type is HTML",
+        ));
+    }
+
+    let header_name = content_disposition_filename(response.headers());
+    if let (Some(dir), Some(name)) = (header_output_dir.as_deref(), header_name.as_deref()) {
+        let header_path = dir.join(sanitize_server_filename(name, &remote_file.file_id));
+        if header_path != target_path {
+            ensure_target_available(&header_path, options.force)?;
+            target_path = header_path;
+        }
+    }
+
+    let Some(expected) = response.content_length() else {
+        warn!(
+            "download response has no Content-Length; falling back to single-connection download"
+        );
+        return sequential_fallback(client, download_url, remote_file, &target_path, options).await;
+    };
+    if expected == 0 {
+        warn!("empty file download uses the single-connection path");
+        return sequential_fallback(client, download_url, remote_file, &target_path, options).await;
+    }
+    warn_on_display_size_mismatch(remote_file, Some(expected));
+    drop(response);
+
+    let segment_resume =
+        prepare_segmented_resume(&target_path, remote_file, expected, options).await?;
+    let part_path = segment_resume.part_path.clone();
+    let sidecar_path = segment_resume.sidecar_path.clone();
+    match try_download_file_segmented(
+        client,
+        download_url,
+        remote_file,
+        &target_path,
+        SegmentedDownloadPlan {
+            expected,
+            header_name,
+            resume: segment_resume,
+        },
+        options,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(SegmentDownloadError::Fallback(reason)) => {
+            warn!(
+                "segmented download was not accepted by the server: {reason}; falling back to one connection"
+            );
+            remove_if_exists(&part_path).await?;
+            remove_if_exists(&sidecar_path).await?;
+            sequential_fallback(client, download_url, remote_file, &target_path, options).await
+        }
+        Err(SegmentDownloadError::Failed(error)) => Err(error),
+    }
+}
+
+async fn sequential_fallback(
+    client: &reqwest::Client,
+    download_url: &str,
+    remote_file: &RemoteFile,
+    final_path: &Path,
+    options: &DownloadOptions,
+) -> Result<SingleDownloadOutcome, GfileError> {
+    let mut sequential_options = options.clone();
+    sequential_options.threads = DEFAULT_DOWNLOAD_THREADS;
+    sequential_options.no_resume = true;
+    try_download_file_sequential(
+        client,
+        download_url,
+        remote_file,
+        final_path,
+        &sequential_options,
+    )
+    .await
+}
+
+async fn try_download_file_segmented(
+    client: &reqwest::Client,
+    download_url: &str,
+    remote_file: &RemoteFile,
+    final_path: &Path,
+    plan: SegmentedDownloadPlan,
+    options: &DownloadOptions,
+) -> Result<SingleDownloadOutcome, SegmentDownloadError> {
+    let expected = plan.expected;
+    let header_name = plan.header_name;
+    let segment_resume = plan.resume;
+    let part_file = if segment_resume.resumed {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&segment_resume.part_path)
+            .await
+            .map_err(|source| {
+                SegmentDownloadError::Failed(io_error(
+                    source,
+                    &segment_resume.part_path,
+                    IoOp::Write,
+                ))
+            })?
+    } else {
+        File::create(&segment_resume.part_path)
+            .await
+            .map_err(|source| {
+                SegmentDownloadError::Failed(io_error(
+                    source,
+                    &segment_resume.part_path,
+                    IoOp::Create,
+                ))
+            })?
+    };
+    part_file.set_len(expected).await.map_err(|source| {
+        SegmentDownloadError::Failed(io_error(source, &segment_resume.part_path, IoOp::Write))
+    })?;
+    drop(part_file);
+
+    write_segment_sidecar(
+        &segment_resume.sidecar_path,
+        &remote_file.file_id,
+        expected,
+        options.key.is_some(),
+        &segment_resume.segments,
+    )
+    .await
+    .map_err(SegmentDownloadError::Failed)?;
+
+    let initial_bytes = segment_resume
+        .segments
+        .iter()
+        .map(segment_completed_bytes)
+        .sum();
+    let progress = ByteProgress::new(Some(expected), options.quiet, &remote_file.raw_name);
+    if initial_bytes > 0 {
+        progress.inc(initial_bytes);
+    }
+
+    let shared_segments = Arc::new(Mutex::new(segment_resume.segments.clone()));
+    let context = SegmentContext {
+        client: client.clone(),
+        download_url: download_url.to_owned(),
+        part_path: segment_resume.part_path.clone(),
+        sidecar_path: segment_resume.sidecar_path.clone(),
+        file_id: remote_file.file_id.clone(),
+        expected,
+        key_used: options.key.is_some(),
+        timeout: options.timeout,
+        progress: progress.clone(),
+        shared_segments: Arc::clone(&shared_segments),
+    };
+    let mut handles = Vec::new();
+    for (index, segment) in segment_resume.segments.iter().enumerate() {
+        if segment.done {
+            continue;
+        }
+        let context = context.clone();
+        let retries = options.retries;
+        handles.push(tokio::spawn(async move {
+            download_segment_with_retries(context, index, retries).await
+        }));
+    }
+
+    let mut first_worker_error = None;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if first_worker_error.is_none() => {
+                first_worker_error = Some(error);
+            }
+            Ok(Err(_)) => {}
+            Err(source) => {
+                if first_worker_error.is_none() {
+                    first_worker_error = Some(SegmentDownloadError::Failed(GfileError::Network {
+                        source: boxed(source),
+                        context: "joining segmented download worker".to_owned(),
+                    }));
+                }
+            }
+        }
+    }
+    if let Some(error) = first_worker_error {
+        return Err(error);
+    }
+    progress.finish();
+
+    let final_segments =
+        segment_snapshot(&shared_segments).map_err(SegmentDownloadError::Failed)?;
+    if final_segments.iter().any(|segment| !segment.done) {
+        return Err(SegmentDownloadError::Failed(GfileError::SizeMismatch {
+            expected,
+            actual: final_segments.iter().map(segment_completed_bytes).sum(),
+        }));
+    }
+
+    write_segment_sidecar(
+        &segment_resume.sidecar_path,
+        &remote_file.file_id,
+        expected,
+        options.key.is_some(),
+        &final_segments,
+    )
+    .await
+    .map_err(SegmentDownloadError::Failed)?;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&segment_resume.part_path)
+        .await
+        .map_err(|source| {
+            SegmentDownloadError::Failed(io_error(source, &segment_resume.part_path, IoOp::Write))
+        })?;
+    file.sync_all().await.map_err(|source| {
+        SegmentDownloadError::Failed(io_error(source, &segment_resume.part_path, IoOp::Write))
+    })?;
+
+    promote_part(
+        &segment_resume.part_path,
+        &segment_resume.sidecar_path,
+        final_path,
+        options.force,
+    )
+    .await
+    .map_err(SegmentDownloadError::Failed)?;
+
+    info!("downloaded {} bytes to {}", expected, final_path.display());
+
+    Ok(SingleDownloadOutcome {
+        name: header_name,
+        path: final_path.to_owned(),
+        bytes: expected,
+        resumed: segment_resume.resumed,
+        threads: final_segments.len() as u8,
+    })
+}
+
+async fn download_segment_with_retries(
+    context: SegmentContext,
+    index: usize,
+    retries: u32,
+) -> Result<(), SegmentDownloadError> {
+    let mut attempt = 0;
+    loop {
+        match try_download_segment(&context, index).await {
+            Ok(()) => return Ok(()),
+            Err(SegmentDownloadError::Fallback(reason)) => {
+                return Err(SegmentDownloadError::Fallback(reason));
+            }
+            Err(SegmentDownloadError::Failed(error))
+                if http::is_retryable(&error) && attempt < retries =>
+            {
+                warn!(
+                    "retrying download segment {} after error: {}",
+                    index + 1,
+                    error.user_message()
+                );
+                tokio::time::sleep(http::retry_delay(attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn try_download_segment(
+    context: &SegmentContext,
+    index: usize,
+) -> Result<(), SegmentDownloadError> {
+    let segment =
+        segment_at(&context.shared_segments, index).map_err(SegmentDownloadError::Failed)?;
+    let segment_len = segment_len(&segment);
+    let already_downloaded = segment.downloaded.min(segment_len);
+    if segment.done || already_downloaded == segment_len {
+        update_segment_sidecar_sync(context, index, segment_len, true)
+            .map_err(SegmentDownloadError::Failed)?;
+        return Ok(());
+    }
+
+    let range_start = segment.start + already_downloaded;
+    let mut response = send_segment_request(context, range_start, segment.end).await?;
+    if response.status() == StatusCode::OK {
+        return Err(SegmentDownloadError::Fallback(
+            "server returned HTTP 200 to a Range request".to_owned(),
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(SegmentDownloadError::Failed(http::status_error(
+            response.status(),
+            &context.download_url,
+        )));
+    }
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(SegmentDownloadError::Fallback(format!(
+            "server returned HTTP {} to a Range request",
+            response.status().as_u16()
+        )));
+    }
+
+    let content_range = parse_content_range(response.headers()).map_err(|error| {
+        SegmentDownloadError::Fallback(format!(
+            "invalid segment Content-Range: {}",
+            error.user_message()
+        ))
+    })?;
+    if content_range.start != range_start {
+        return Err(SegmentDownloadError::Fallback(format!(
+            "Content-Range starts at {}, expected {}",
+            content_range.start, range_start
+        )));
+    }
+    if content_range.end != segment.end {
+        return Err(SegmentDownloadError::Fallback(format!(
+            "Content-Range ends at {}, expected {}",
+            content_range.end, segment.end
+        )));
+    }
+    if let Some(total) = content_range.total {
+        if total != context.expected {
+            return Err(SegmentDownloadError::Fallback(format!(
+                "Content-Range total is {total}, expected {}",
+                context.expected
+            )));
+        }
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&context.part_path)
+        .await
+        .map_err(|source| {
+            SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
+        })?;
+    file.seek(SeekFrom::Start(range_start))
+        .await
+        .map_err(|source| {
+            SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
+        })?;
+
+    let mut downloaded = already_downloaded;
+    loop {
+        let chunk = match next_chunk(&mut response, context.timeout).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(ChunkReadError::Timeout) => {
+                return Err(SegmentDownloadError::Failed(timeout_network_error(
+                    "reading download segment",
+                )));
+            }
+            Err(ChunkReadError::Http(source)) => {
+                return Err(SegmentDownloadError::Failed(network_error(
+                    source,
+                    "reading download segment",
+                )));
+            }
+        };
+        if downloaded + chunk.len() as u64 > segment_len {
+            return Err(SegmentDownloadError::Failed(GfileError::SizeMismatch {
+                expected: segment_len,
+                actual: downloaded + chunk.len() as u64,
+            }));
+        }
+        file.write_all(&chunk).await.map_err(|source| {
+            SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
+        })?;
+        downloaded += chunk.len() as u64;
+        context.progress.inc(chunk.len() as u64);
+        update_segment_sidecar_sync(context, index, downloaded, false)
+            .map_err(SegmentDownloadError::Failed)?;
+    }
+
+    if downloaded != segment_len {
+        return Err(SegmentDownloadError::Failed(GfileError::SizeMismatch {
+            expected: segment_len,
+            actual: downloaded,
+        }));
+    }
+    file.sync_data().await.map_err(|source| {
+        SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
+    })?;
+    update_segment_sidecar_sync(context, index, downloaded, true)
+        .map_err(SegmentDownloadError::Failed)?;
+    Ok(())
+}
+
+async fn send_segment_request(
+    context: &SegmentContext,
+    start: u64,
+    end: u64,
+) -> Result<reqwest::Response, SegmentDownloadError> {
+    let request = context
+        .client
+        .get(&context.download_url)
+        .header(header::RANGE, format!("bytes={start}-{end}"));
+    let result = tokio::time::timeout(context.timeout, request.send())
+        .await
+        .map_err(|_| {
+            SegmentDownloadError::Failed(timeout_network_error("starting download segment"))
+        })?;
+    result.map_err(|source| {
+        SegmentDownloadError::Failed(network_error(source, "starting download segment"))
+    })
+}
+
+async fn prepare_segmented_resume(
+    final_path: &Path,
+    remote_file: &RemoteFile,
+    expected: u64,
+    options: &DownloadOptions,
+) -> Result<SegmentResumePlan, GfileError> {
+    let (part_path, sidecar_path) = part_paths(final_path)?;
+    let fresh_segments = build_segments(expected, options.threads);
+
+    if options.no_resume {
+        remove_if_exists(&part_path).await?;
+        remove_if_exists(&sidecar_path).await?;
+        return Ok(SegmentResumePlan {
+            part_path,
+            sidecar_path,
+            segments: fresh_segments,
+            resumed: false,
+        });
+    }
+
+    if !part_path.exists() {
+        return Ok(SegmentResumePlan {
+            part_path,
+            sidecar_path,
+            segments: fresh_segments,
+            resumed: false,
+        });
+    }
+
+    let sidecar = match fs::read(&sidecar_path).await {
+        Ok(bytes) => parse_segment_sidecar(&bytes),
+        Err(_) => None,
+    };
+    let Some(mut sidecar) = sidecar else {
+        warn!("existing segmented .part has missing or damaged v2 sidecar; restarting from zero");
+        return Ok(SegmentResumePlan {
+            part_path,
+            sidecar_path,
+            segments: fresh_segments,
+            resumed: false,
+        });
+    };
+
+    if sidecar.version != 2
+        || sidecar.file_id != remote_file.file_id
+        || sidecar.expected != expected
+        || sidecar.key_used != options.key.is_some()
+        || !segments_match(&sidecar.segments, &fresh_segments)
+        || !normalize_segments(&mut sidecar.segments)
+    {
+        warn!(
+            "existing .part sidecar cannot be used for this segmented download; restarting from zero"
+        );
+        return Ok(SegmentResumePlan {
+            part_path,
+            sidecar_path,
+            segments: fresh_segments,
+            resumed: false,
+        });
+    }
+
+    let resumed = sidecar
+        .segments
+        .iter()
+        .any(|segment| segment.done || segment.downloaded > 0);
+    Ok(SegmentResumePlan {
+        part_path,
+        sidecar_path,
+        segments: sidecar.segments,
+        resumed,
+    })
+}
+
+fn build_segments(expected: u64, requested_threads: u8) -> Vec<SegmentState> {
+    let count = u64::from(requested_threads).min(expected).max(1);
+    let base = expected / count;
+    let remainder = expected % count;
+    let mut start = 0;
+    let mut segments = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let len = base + u64::from(index < remainder);
+        let end = start + len - 1;
+        segments.push(SegmentState {
+            start,
+            end,
+            done: false,
+            downloaded: 0,
+        });
+        start = end + 1;
+    }
+    segments
+}
+
+fn parse_segment_sidecar(bytes: &[u8]) -> Option<SegmentSidecar> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("version")?.as_u64()? != 2 {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+fn normalize_segments(segments: &mut [SegmentState]) -> bool {
+    for segment in segments {
+        let len = segment_len(segment);
+        if segment.downloaded > len {
+            return false;
+        }
+        if segment.done {
+            segment.downloaded = len;
+        } else if segment.downloaded == len {
+            segment.done = true;
+        }
+    }
+    true
+}
+
+fn segments_match(existing: &[SegmentState], desired: &[SegmentState]) -> bool {
+    existing.len() == desired.len()
+        && existing
+            .iter()
+            .zip(desired)
+            .all(|(left, right)| left.start == right.start && left.end == right.end)
+}
+
+fn segment_at(
+    segments: &Arc<Mutex<Vec<SegmentState>>>,
+    index: usize,
+) -> Result<SegmentState, GfileError> {
+    let guard = segments.lock().map_err(|_| GfileError::Parse {
+        what: "segmented download state lock was poisoned".to_owned(),
+        hint: "This is an internal state error; please report it.".to_owned(),
+    })?;
+    guard.get(index).cloned().ok_or_else(|| GfileError::Parse {
+        what: format!("missing segment state at index {index}"),
+        hint: "This is an internal state error; please report it.".to_owned(),
+    })
+}
+
+fn segment_snapshot(
+    segments: &Arc<Mutex<Vec<SegmentState>>>,
+) -> Result<Vec<SegmentState>, GfileError> {
+    segments
+        .lock()
+        .map(|segments| segments.clone())
+        .map_err(|_| GfileError::Parse {
+            what: "segmented download state lock was poisoned".to_owned(),
+            hint: "This is an internal state error; please report it.".to_owned(),
+        })
+}
+
+fn update_segment_sidecar_sync(
+    context: &SegmentContext,
+    index: usize,
+    downloaded: u64,
+    done: bool,
+) -> Result<(), GfileError> {
+    let mut segments = context
+        .shared_segments
+        .lock()
+        .map_err(|_| GfileError::Parse {
+            what: "segmented download state lock was poisoned".to_owned(),
+            hint: "This is an internal state error; please report it.".to_owned(),
+        })?;
+    let Some(segment) = segments.get_mut(index) else {
+        return Err(GfileError::Parse {
+            what: format!("missing segment state at index {index}"),
+            hint: "This is an internal state error; please report it.".to_owned(),
+        });
+    };
+    segment.downloaded = downloaded;
+    segment.done = done;
+    let bytes = segment_sidecar_bytes(
+        &context.file_id,
+        context.expected,
+        context.key_used,
+        &segments,
+    )?;
+    std::fs::write(&context.sidecar_path, bytes)
+        .map_err(|source| io_error(source, &context.sidecar_path, IoOp::Write))
+}
+
+async fn write_segment_sidecar(
+    sidecar_path: &Path,
+    file_id: &str,
+    expected: u64,
+    key_used: bool,
+    segments: &[SegmentState],
+) -> Result<(), GfileError> {
+    let sidecar_bytes = segment_sidecar_bytes(file_id, expected, key_used, segments)?;
+    fs::write(sidecar_path, sidecar_bytes)
+        .await
+        .map_err(|source| io_error(source, sidecar_path, IoOp::Write))
+}
+
+fn segment_sidecar_bytes(
+    file_id: &str,
+    expected: u64,
+    key_used: bool,
+    segments: &[SegmentState],
+) -> Result<Vec<u8>, GfileError> {
+    let sidecar = SegmentSidecar {
+        version: 2,
+        file_id: file_id.to_owned(),
+        expected,
+        key_used,
+        segments: segments.to_vec(),
+    };
+    serde_json::to_vec(&sidecar).map_err(|source| GfileError::Parse {
+        what: format!("failed to serialize segmented sidecar: {source}"),
+        hint: "This is an internal state error; please report it.".to_owned(),
+    })
+}
+
+fn segment_len(segment: &SegmentState) -> u64 {
+    segment.end - segment.start + 1
+}
+
+fn segment_completed_bytes(segment: &SegmentState) -> u64 {
+    if segment.done {
+        segment_len(segment)
+    } else {
+        segment.downloaded.min(segment_len(segment))
+    }
 }
 
 async fn send_download_request(
@@ -588,6 +1337,7 @@ async fn complete_if_range_already_finished(
         path: final_path.to_owned(),
         bytes: start,
         resumed: true,
+        threads: DEFAULT_DOWNLOAD_THREADS,
     }))
 }
 
@@ -765,6 +1515,10 @@ fn parse_content_range(headers: &header::HeaderMap) -> Result<ContentRange, Gfil
         what: format!("invalid Content-Range start in {value:?}"),
         hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
     })?;
+    let end = captures[2].parse::<u64>().map_err(|_| GfileError::Parse {
+        what: format!("invalid Content-Range end in {value:?}"),
+        hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
+    })?;
     let total = if &captures[3] == "*" {
         None
     } else {
@@ -773,7 +1527,7 @@ fn parse_content_range(headers: &header::HeaderMap) -> Result<ContentRange, Gfil
             hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
         })?)
     };
-    Ok(ContentRange { start, total })
+    Ok(ContentRange { start, end, total })
 }
 
 fn is_html_content_type(headers: &header::HeaderMap) -> bool {

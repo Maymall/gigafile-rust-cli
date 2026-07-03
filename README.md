@@ -16,6 +16,10 @@ upload and download files straight from the terminal.
   interrupted transfer continue where it stopped. Completion is atomic (the file
   is renamed into place only after the full body is verified against the
   server-reported size). Use `--no-resume` to always start from zero.
+- **Optional segmented downloads** — downloads use one connection by default.
+  Use `--threads N` (1-16) to split a known-size file into HTTP Range segments;
+  if the server rejects segmented Range requests, `rgfile` falls back to a
+  single-connection download.
 - **Correct filenames** — real names are decoded from `Content-Disposition`,
   including RFC 5987 `filename*=` values, so UTF-8 and Japanese names survive
   intact even when the page masks the displayed name.
@@ -148,6 +152,12 @@ Emit a single JSON object for scripting:
 rgfile download --json https://23.gigafile.nu/0123abcd-000000example
 ```
 
+Use explicit per-file download concurrency:
+
+```bash
+rgfile download --threads 4 https://23.gigafile.nu/0123abcd-000000example
+```
+
 ### Upload
 
 Upload a file and print the resulting public download URL:
@@ -199,6 +209,7 @@ defaults.
 ```toml
 [download]
 dir = "/home/alice/Downloads"
+threads = 1
 
 [upload]
 lifetime = 7
@@ -218,6 +229,7 @@ Supported keys:
 | Key | Meaning |
 |---|---|
 | `download.dir` | Default output directory for downloads; `-o/--output` overrides it. |
+| `download.threads` | Default download connection count per file: 1-16. `--threads` overrides it. |
 | `upload.lifetime` | Default upload lifetime: 3, 5, 7, 14, 30, 60, or 100 days. |
 | `network.timeout` | Default transfer/request timeout in seconds. |
 | `network.retries` | Default retry count for retryable network/server failures. |
@@ -275,11 +287,15 @@ credential exposure risk.
 
 ## Behavior and limits
 
-- **Sequential by design.** Both downloads (including every file of a matomete
-  page) and upload chunks are processed one at a time. This is deliberate — the
-  tool aims to be gentle to the service rather than maximize throughput. For a
-  matomete page, a failing file does not stop the others; the process exit code
-  is the first failure encountered.
+- **Conservative by default.** Downloads use one connection unless you pass
+  `--threads` or set `download.threads`. A matomete page is still processed one
+  file at a time; each file may use segmented Range requests up to the configured
+  per-file limit. If segmented Range behavior is not supported by the server,
+  the file is retried once through the single-connection path. For a matomete
+  page, a failing file does not stop the others; the process exit code is the
+  first failure encountered.
+- **Uploads stay sequential.** Upload chunks are processed one at a time to keep
+  memory use and service load predictable.
 - **Uploads do not resume across runs.** Resume applies to downloads only. If an
   upload run fails, the next attempt re-uploads the whole file.
 - **No bypass, no brute force, no scraping.** `rgfile` does not circumvent

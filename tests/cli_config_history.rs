@@ -65,6 +65,87 @@ async fn config_download_dir_and_user_agent_apply_and_cli_output_overrides() {
 }
 
 #[tokio::test]
+async fn config_download_threads_applies_and_cli_threads_overrides() {
+    let server = MockServer::start().await;
+    mount_page(&server).await;
+    let body = binary_body(12 * 1024);
+    let runs = Arc::new(Mutex::new(Vec::<Vec<(u64, u64)>>::new()));
+    let responder_runs = Arc::clone(&runs);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some(range) = range_header(request) {
+                responder_runs
+                    .lock()
+                    .unwrap()
+                    .last_mut()
+                    .expect("probe request should start a run")
+                    .push(range);
+                range_response(&responder_body, range.0, range.1)
+            } else {
+                responder_runs.lock().unwrap().push(Vec::new());
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", responder_body.len().to_string())
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(responder_body.clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let config_output = temp.path().join("from-config");
+    let cli_output = temp.path().join("from-cli");
+    std::fs::create_dir_all(&cli_output).unwrap();
+    let config = write_config(
+        &temp,
+        &format!(
+            "[download]\ndir = \"{}\"\nthreads = 3\n\n[network]\nretries = 0\n",
+            toml_path(&config_output)
+        ),
+    );
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["--config"])
+        .arg(&config)
+        .args(["download", &format!("{}/{FILE_ID}", server.uri())])
+        .assert()
+        .success();
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "download",
+            "--threads",
+            "2",
+            &format!("{}/{FILE_ID}", server.uri()),
+            "-o",
+        ])
+        .arg(&cli_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(config_output.join("example file.bin")).unwrap(),
+        body
+    );
+    assert_eq!(
+        std::fs::read(cli_output.join("example file.bin")).unwrap(),
+        body
+    );
+    let runs = runs.lock().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].len(), 3);
+    assert_eq!(runs[1].len(), 2);
+}
+
+#[tokio::test]
 async fn config_upload_lifetime_applies_and_cli_lifetime_overrides() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
@@ -372,6 +453,28 @@ async fn mount_keyed_file(server: &MockServer, body: Vec<u8>) {
         )
         .mount(server)
         .await;
+}
+
+fn binary_body(size: usize) -> Vec<u8> {
+    (0..size).map(|index| (index % 251) as u8).collect()
+}
+
+fn range_header(request: &Request) -> Option<(u64, u64)> {
+    let value = request.headers.get("range")?.to_str().ok()?;
+    let value = value.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+fn range_response(body: &[u8], start: u64, end: u64) -> ResponseTemplate {
+    ResponseTemplate::new(206)
+        .insert_header(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", body.len()),
+        )
+        .insert_header("Content-Length", (end - start + 1).to_string())
+        .insert_header("Content-Type", "application/octet-stream")
+        .set_body_bytes(body[start as usize..=end as usize].to_vec())
 }
 
 async fn mount_landing(server: &MockServer) {

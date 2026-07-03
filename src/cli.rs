@@ -97,6 +97,10 @@ pub enum Commands {
         #[arg(long = "no-resume")]
         no_resume: bool,
 
+        /// Number of download connections for each file (1-16).
+        #[arg(long = "threads")]
+        threads: Option<u8>,
+
         /// Per-read stall timeout in seconds.
         #[arg(long = "timeout")]
         timeout: Option<u64>,
@@ -258,6 +262,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
             key,
             force,
             no_resume,
+            threads,
             timeout,
             retries,
             user_agent,
@@ -267,12 +272,14 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
         } => {
             let page_url = url.clone();
             let output = resolve_download_output(&config, output)?;
+            let threads = config.resolve_download_threads(threads)?;
             let result = download::download(download::DownloadOptions {
                 url,
                 output,
                 key,
                 force,
                 no_resume,
+                threads,
                 timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
                 retries: config.resolve_retries(retries),
                 user_agent: config.resolve_user_agent(user_agent),

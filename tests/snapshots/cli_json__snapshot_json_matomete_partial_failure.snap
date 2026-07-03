@@ -10,7 +10,8 @@ expression: normalize_json(&output.stdout)
       "error": null,
       "name": "example file.bin",
       "path": "<PATH>",
-      "resumed": false
+      "resumed": false,
+      "threads": 1
     },
     {
       "bytes": null,

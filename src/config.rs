@@ -9,6 +9,7 @@ use directories::BaseDirs;
 use serde::Deserialize;
 
 use crate::{
+    download,
     error::{GfileError, IoOp},
     upload,
 };
@@ -30,6 +31,7 @@ pub struct AppConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DownloadConfig {
     pub dir: Option<PathBuf>,
+    pub threads: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -62,6 +64,14 @@ pub struct LoadOptions<'a> {
 impl AppConfig {
     pub fn resolve_download_output(&self, cli_output: Option<PathBuf>) -> Option<PathBuf> {
         cli_output.or_else(|| self.download.dir.clone())
+    }
+
+    pub fn resolve_download_threads(&self, cli_threads: Option<u8>) -> Result<u8, GfileError> {
+        download::validate_threads(
+            cli_threads
+                .or(self.download.threads)
+                .unwrap_or(download::DEFAULT_DOWNLOAD_THREADS),
+        )
     }
 
     pub fn resolve_timeout_secs(&self, cli_timeout: Option<u64>) -> u64 {
@@ -130,6 +140,9 @@ fn validate(config: &AppConfig) -> Result<(), GfileError> {
     if let Some(lifetime) = config.upload.lifetime {
         upload::validate_lifetime(lifetime)?;
     }
+    if let Some(threads) = config.download.threads {
+        download::validate_threads(threads)?;
+    }
     Ok(())
 }
 
@@ -177,6 +190,10 @@ mod tests {
 
         assert_eq!(config.resolve_timeout_secs(None), DEFAULT_TIMEOUT_SECS);
         assert_eq!(config.resolve_retries(None), DEFAULT_RETRIES);
+        assert_eq!(
+            config.resolve_download_threads(None).unwrap(),
+            download::DEFAULT_DOWNLOAD_THREADS
+        );
         assert_eq!(config.resolve_lifetime(None), DEFAULT_UPLOAD_LIFETIME);
     }
 
@@ -187,6 +204,7 @@ mod tests {
         let config = AppConfig {
             download: DownloadConfig {
                 dir: Some(output.clone()),
+                threads: Some(3),
             },
             upload: UploadConfig { lifetime: Some(7) },
             network: NetworkConfig {
@@ -202,6 +220,8 @@ mod tests {
             Some(temp.path().join("from-cli"))
         );
         assert_eq!(config.resolve_download_output(None), Some(output));
+        assert_eq!(config.resolve_download_threads(Some(2)).unwrap(), 2);
+        assert_eq!(config.resolve_download_threads(None).unwrap(), 3);
         assert_eq!(config.resolve_timeout_secs(Some(8)), 8);
         assert_eq!(config.resolve_timeout_secs(None), 9);
         assert_eq!(config.resolve_retries(Some(4)), 4);
@@ -236,5 +256,18 @@ mod tests {
 
         assert_eq!(error.exit_code(), 2);
         assert!(error.user_message().contains("lifetime must be one of"));
+    }
+
+    #[test]
+    fn invalid_download_threads_is_usage_error() {
+        let error = parse_text("[download]\nthreads = 17\n", Path::new("config.toml"))
+            .expect_err("unsupported thread count should fail");
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .user_message()
+                .contains("download threads must be between 1 and 16")
+        );
     }
 }

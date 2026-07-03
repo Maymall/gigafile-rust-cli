@@ -14,6 +14,7 @@ Options:
   -k, --key <KEY>                Download key [aliases: --password]
       --force                    Overwrite the final output file if it already exists
       --no-resume                Ignore an existing .part file and start from zero
+      --threads <THREADS>        Number of download connections for each file (1-16)
       --timeout <TIMEOUT>        Per-read stall timeout in seconds
       --retries <RETRIES>        Retry count for retryable network/server failures
       --user-agent <USER_AGENT>  Override the default User-Agent

@@ -26,6 +26,8 @@ struct DownloadFileJson<'a> {
     path: Option<String>,
     bytes: Option<u64>,
     resumed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads: Option<u8>,
     error: Option<ErrorJson>,
 }
 
@@ -134,6 +136,7 @@ fn download_file_json(file: &DownloadFileRecord) -> DownloadFileJson<'_> {
         path: file.path.as_deref().map(path_string),
         bytes: file.bytes,
         resumed: file.resumed,
+        threads: file.threads,
         error: file.error.clone(),
     }
 }
