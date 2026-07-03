@@ -2,7 +2,7 @@
 # In-repo copy of the AUR rgfile-bin PKGBUILD. The canonical package lives at
 # https://aur.archlinux.org/packages/rgfile-bin — keep both in sync on release.
 pkgname=rgfile-bin
-pkgver=0.4.0
+pkgver=0.5.1
 pkgrel=1
 pkgdesc="Fast, robust command-line client for GigaFile.nu (prebuilt binary)"
 arch=('x86_64')
@@ -11,7 +11,7 @@ license=('GPL-3.0-only')
 provides=('rgfile')
 conflicts=('rgfile')
 source=("$url/releases/download/v$pkgver/rgfile-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('5551382e4c8cdb0c18a7f4fe27ae0182d4817eec8c56e07aba67baf7f80f99a8')
+sha256sums=('332a1a1ab4ebbc9b5947ea306ed0154d21c0c0824fc8069fcd1d9fa294dbfa92')
 
 package() {
     local dir="rgfile-$pkgver-x86_64-unknown-linux-gnu"
