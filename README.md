@@ -1,191 +1,172 @@
-# gfile-rust
+# rgfile
 
-[![CI](https://github.com/Maymall/gfile-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Maymall/gfile-rust/actions/workflows/ci.yml)
-[![Release](https://github.com/Maymall/gfile-rust/actions/workflows/release.yml/badge.svg)](https://github.com/Maymall/gfile-rust/actions/workflows/release.yml)
+[![CI](https://github.com/Maymall/gigafile-rust-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Maymall/gigafile-rust-cli/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
 
-`gfile-rust` is a Rust command line tool for automating public GigaFile web
-upload and download flows. Download support covers single-file and matomete
-pages; upload support covers single-file uploads.
+`rgfile` is a fast, robust command-line client for [GigaFile.nu](https://gigafile.nu):
+upload and download files straight from the terminal.
+
+## Features
+
+- **Single-file and multi-file downloads** — handles both individual file pages
+  and multi-file *matomete* pages.
+- **Password-protected links** — supply the key with `--key` (alias
+  `--password`); it is sent to the server as `dlkey` and never written to disk.
+- **Resumable downloads** — a `.part` file plus a metadata sidecar let an
+  interrupted transfer continue where it stopped. Completion is atomic (the file
+  is renamed into place only after the full body is verified against the
+  server-reported size). Use `--no-resume` to always start from zero.
+- **Correct filenames** — real names are decoded from `Content-Disposition`,
+  including RFC 5987 `filename*=` values, so UTF-8 and Japanese names survive
+  intact even when the page masks the displayed name.
+- **Windows-safe names** — filenames are sanitized so they are valid on Windows
+  as well as Unix.
+- **Constant-memory uploads** — files are streamed to the server in chunks, so
+  peak memory stays around 10 MiB regardless of the configured chunk size.
+- **Resilient transfers** — chunks are sent sequentially with per-chunk retry;
+  `--timeout` measures a *stall* (idle) window, not the total transfer duration.
+- **Optional upload verification** — after upload, the returned page is checked
+  against the remote `Content-Length`. Skip it with `--no-verify`.
+- **Lifetime selection** — choose how long an upload lives: 3, 5, 7, 14, 30, 60,
+  or 100 days.
+- **Machine-readable output** — `--json` prints one final JSON object per run.
+- **Meaningful exit codes** — every failure maps to a stable, documented code
+  (see [Exit codes](#exit-codes)).
+- **Static Linux binary** — a fully static musl build is published for Linux.
 
 ## Install
 
-### Download a Release
+### Prebuilt binaries
 
-Download the archive for your platform from
-[GitHub Releases](https://github.com/Maymall/gfile-rust/releases), then verify
-it with `SHA256SUMS`:
+Download the archive for your platform from the
+[latest release](https://github.com/Maymall/gigafile-rust-cli/releases/latest).
+Assets are named `rgfile-<version>-<target>`:
+
+| Platform | Target |
+|---|---|
+| Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` |
+| Linux x86_64 (static musl) | `x86_64-unknown-linux-musl` |
+| macOS (Apple silicon) | `aarch64-apple-darwin` |
+| macOS (Intel) | `x86_64-apple-darwin` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+Each release also ships `SHA256SUMS`; verify your download before use:
 
 ```bash
 sha256sum -c SHA256SUMS
 ```
 
-Archives contain the `gfile` binary plus `LICENSE`, `NOTICE`, `NOTICE.md`, and
-`README.md`.
+### From source
 
-| Platform | Target | Archive |
-|---|---|---|
-| Linux x86_64 glibc | `x86_64-unknown-linux-gnu` | `.tar.gz` |
-| Linux x86_64 musl | `x86_64-unknown-linux-musl` | `.tar.gz` |
-| macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` |
-| macOS Intel | `x86_64-apple-darwin` | `.tar.gz` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
-
-### Install from Source
+Requires Rust 1.85 or newer (MSRV 1.85):
 
 ```bash
-cargo install --git https://github.com/Maymall/gfile-rust --tag v0.3.0
+cargo install --git https://github.com/Maymall/gigafile-rust-cli
 ```
 
-## Upload Usage
+## Usage
 
-Upload a local file and print the public download page URL:
+### Download
+
+Download a page into the current directory:
 
 ```bash
-gfile upload ./example-file.bin
+rgfile download https://23.gigafile.nu/0123abcd-000000example
 ```
 
-The default lifetime is 100 days. GigaFile-supported lifetimes can be selected
-explicitly:
+Choose an output directory, or an explicit filename for a single-file page:
 
 ```bash
-gfile upload ./example-file.bin --lifetime 7
+rgfile download https://23.gigafile.nu/0123abcd-000000example -o ./downloads
+rgfile download https://23.gigafile.nu/0123abcd-000000example -o "./example file.bin"
 ```
 
-Uploads are split into serial multipart chunks. The default chunk size is
-100MiB; values from 1MiB through 1GiB are accepted:
+Provide a key for a password-protected link:
 
 ```bash
-gfile upload ./example-file.bin --chunk-size 50M
+rgfile download https://23.gigafile.nu/0123abcd-000000example --key EXAMPLE-KEY-0000
 ```
 
-`--timeout` is an idle timeout. During upload, it is measured from the last body
-stream progress or response completion activity, not from the total chunk
-duration.
+If a page needs a key and none is given, `rgfile` prompts once (without echoing)
+on an interactive terminal; non-interactive runs exit with code 15.
 
-After upload, `gfile-rust` verifies the returned download page by checking the
-remote `Content-Length`. Use `--no-verify` only when the server cannot expose a
-reliable length and you have another way to validate the result.
-
-For scripts, upload also supports final JSON output:
+Emit a single JSON object for scripting:
 
 ```bash
-gfile upload --json ./example-file.bin
+rgfile download --json https://23.gigafile.nu/0123abcd-000000example
 ```
 
-## Download Usage
+### Upload
 
-Download a public file page into the current directory:
+Upload a file and print the resulting public download URL:
 
 ```bash
-gfile download https://23.gigafile.nu/0123abcd-000000example
+rgfile upload ./example-file.bin
 ```
 
-Choose an output directory or, for a single-file page, an explicit filename:
+Pick a lifetime (default 100 days; one of 3, 5, 7, 14, 30, 60, 100):
 
 ```bash
-gfile download https://23.gigafile.nu/0123abcd-000000example -o ./downloads
-gfile download https://23.gigafile.nu/0123abcd-000000example -o "./example file.bin"
+rgfile upload ./example-file.bin --lifetime 7
 ```
 
-Download with a key:
+Tune the streaming chunk size (default `100MiB`; accepts a `K`/`M`/`G` suffix,
+from 1 MiB up to 1 GiB):
 
 ```bash
-gfile download https://23.gigafile.nu/0123abcd-000000example --key EXAMPLE-KEY-0000
+rgfile upload ./example-file.bin --chunk-size 50M
 ```
 
-If a page requires a key and `--key` is not provided, an interactive terminal
-will prompt once without echoing input. Non-interactive runs exit with code 15.
-
-Resume is enabled by default when a matching `.part` and `.part.json` sidecar
-exist. Use `--no-resume` to ignore partial state and start from zero.
-
-For scripts, use `--json` to print one final JSON object to stdout and suppress
-progress output:
+Skip post-upload verification:
 
 ```bash
-gfile download --json https://23.gigafile.nu/0123abcd-000000example
+rgfile upload ./example-file.bin --no-verify
 ```
 
-## Behavior
+Emit a single JSON object for scripting:
 
-- Downloads retry retryable network failures and HTTP 5xx responses.
-- Download `--timeout` is a per-read stall timeout.
-- Uploads retry retryable network failures and HTTP 5xx chunk responses.
-- Upload `--timeout` is an idle timeout while sending a chunk or waiting for the
-  chunk response.
-- Matomete pages are downloaded sequentially. If one file fails, later files are
-  still attempted and the final process exit code is the first failure code.
-- Uploads are intentionally serial and stream chunks from disk.
-- When GigaFile's page masks the displayed filename, `gfile-rust` prefers the
-  `Content-Disposition` filename from the actual file response, including UTF-8
-  `filename*=` values.
+```bash
+rgfile upload --json ./example-file.bin
+```
 
-## From Python gfile
+## Exit codes
 
-| Python gfile | gfile-rust | Notes |
-|---|---|---|
-| `gfile upload FILE` | `gfile upload FILE` | Uploads are intentionally serial and stream chunks from disk. |
-| fixed upload lifetime | `--lifetime <DAYS>` | Accepted values: 3, 5, 7, 14, 30, 60, 100. |
-| upload progress | upload progress | Progress advances while streaming each chunk and is reset on retry until the chunk is confirmed. |
-| upload timeout | `--timeout <SECONDS>` | Idle timeout, not total chunk duration. |
-| `gfile download URL` | `gfile download URL` | Same basic download shape. |
-| `--key` / `--password` | `--key` / `--password` / `-k` | Password value is sent as `dlkey`. |
-| output filename | `-o <PATH>` | For matomete, `-o` must be an existing directory. |
-| built-in sequential download | built-in sequential download | Matomete files are intentionally not downloaded in parallel. |
-| threaded upload | not implemented | This build avoids high-concurrency upload behavior. |
-| `--aria2` | not implemented | Multi-connection aria2 integration is planned only as a backlog item. |
-| JSON output | `--json` | Rust version provides a stable final JSON object. |
+`0` indicates success. Failures use the following codes:
 
-## Exit Codes
-
-| Code | Error | Meaning |
+| Code | Name | Meaning |
 |---:|---|---|
 | 2 | `usage` | Invalid CLI arguments or unsupported option value. |
-| 10 | `invalid_url` | URL is not a supported public download page URL. |
+| 10 | `invalid_url` | The URL is not a supported GigaFile download page. |
 | 11 | `network` | Network request, timeout, or retry exhaustion failure. |
-| 12 | `http_status` | Unexpected non-retryable HTTP status while downloading. |
+| 12 | `http_status` | Unexpected non-retryable HTTP status. |
 | 13 | `parse` | Required page data could not be parsed. |
-| 14 | `not_found_or_expired` | File page reports missing or expired content. |
-| 15 | `key_required` | Download key is required but unavailable. |
-| 16 | `password_wrong` | Download key was rejected. |
-| 17 | `size_mismatch` | Downloaded size did not match the expected size. |
+| 14 | `not_found_or_expired` | The file was not found or has expired. |
+| 15 | `key_required` | A download key is required but was not available. |
+| 16 | `password_wrong` | The download key was rejected. |
+| 17 | `size_mismatch` | Downloaded size did not match the server header. |
 | 18 | `io` | Local filesystem error. |
-| 19 | `upload_rejected` | Upload endpoint rejected the upload. |
+| 19 | `upload_rejected` | The upload endpoint rejected the upload. |
 | 20 | `verify_failed` | Upload verification found a size mismatch. |
 
-## Security
+## Behavior and limits
 
-Download keys are never written to the resume sidecar; the sidecar stores only
-whether a key was used. Cookies are kept in memory and are not persisted.
+- **Sequential by design.** Both downloads (including every file of a matomete
+  page) and upload chunks are processed one at a time. This is deliberate — the
+  tool aims to be gentle to the service rather than maximize throughput. For a
+  matomete page, a failing file does not stop the others; the process exit code
+  is the first failure encountered.
+- **Uploads do not resume across runs.** Resume applies to downloads only. If an
+  upload run fails, the next attempt re-uploads the whole file.
+- **No bypass, no brute force, no scraping.** `rgfile` does not circumvent
+  GigaFile restrictions, does not guess or brute-force passwords, and does not
+  crawl or scrape links.
 
-Passing `--key EXAMPLE-KEY-0000` can expose the value through shell history or
-process listings such as `ps`. Prefer the interactive prompt when that matters.
-Do not publish `--dump-page` output without reviewing it; it may contain private
-filenames or page details.
+## License and acknowledgements
 
-## GPL Compliance
+`rgfile` is licensed under **GPL-3.0-only**; see [LICENSE](LICENSE).
 
-- License: GPL-3.0-only; see [LICENSE](LICENSE).
-- Attribution: this rewrite is derived from and substantially informed by
-  GPL-3.0 `Sraq-Zit/gfile` and `fireattack/gfile`; see [NOTICE.md](NOTICE.md).
-- Binary release archives include `LICENSE`, `NOTICE`, `NOTICE.md`, and
-  `README.md`.
-- Corresponding source for a release is the repository tag with the same name,
-  for example `v0.3.0`.
-- No additional license restrictions are imposed by the release packaging.
-
-## Disclaimer
-
-This is an unofficial tool. Users are responsible for complying with GigaFile's
-official terms and acceptable-use rules.
-
-## Behavior Boundaries
-
-- No password guessing, dictionary attacks, link scanning, or enumeration.
-- No high-concurrency stress or load-testing mode.
-- No bypass of download pages, advertising, membership restrictions, or other
-  service controls.
-- No persistence of cookies, passwords, tokens, or download keys to disk.
-- No third-party email notification features.
-- No browser impersonation for bypass purposes.
+It is derived from the GPL-licensed Python projects
+[`Sraq-Zit/gfile`](https://github.com/Sraq-Zit/gfile) and
+[`fireattack/gfile`](https://github.com/fireattack/gfile); see
+[NOTICE.md](NOTICE.md) for details. The corresponding source for any binary
+release is this repository at the matching release tag.
