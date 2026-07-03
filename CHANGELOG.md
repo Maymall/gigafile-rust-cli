@@ -7,6 +7,8 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-03
+
 ### Added
 
 - Bootstrap the Rust package, CLI shell, GPL compliance files, and CI workflow.
