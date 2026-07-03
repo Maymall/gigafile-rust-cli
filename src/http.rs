@@ -30,6 +30,11 @@ pub fn build_client(user_agent: Option<&str>) -> Result<Client, GfileError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(Policy::limited(REDIRECT_LIMIT))
         .gzip(true)
+        // Live 2026-07-03: GigaFile matches header names case-sensitively and
+        // ignores hyper's lowercase `range:`, answering 200 instead of 206.
+        // Title-cased HTTP/1.1 headers make Range (resume + segmented
+        // downloads) actually work against the real server.
+        .http1_title_case_headers()
         .build()
         .map_err(|source| GfileError::Network {
             source: boxed(source),

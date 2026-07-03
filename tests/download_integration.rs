@@ -210,6 +210,46 @@ async fn download_size_mismatch_keeps_part_file() {
 }
 
 #[tokio::test]
+async fn download_range_header_is_sent_title_cased_for_legacy_servers() {
+    // Live 2026-07-03: GigaFile matches header names case-sensitively and
+    // ignores hyper's default lowercase `range:`, replying 200 instead of 206.
+    let (server_uri, captured) = start_header_capture_server(
+        include_str!("fixtures/single_basic.html")
+            .as_bytes()
+            .to_vec(),
+        binary_body(2 * 1024),
+    );
+    let temp = TempDir::new().unwrap();
+    let opts = DownloadOptions {
+        url: format!("{server_uri}/{FILE_ID}"),
+        output: Some(temp.path().to_owned()),
+        force: false,
+        timeout: Duration::from_secs(60),
+        retries: 0,
+        user_agent: None,
+        dump_page: None,
+        no_resume: false,
+        key: None,
+        selection: None,
+        threads: 2,
+        quiet: true,
+        allow_any_host: true,
+    };
+
+    let _ = download(opts).await;
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        request.contains("\r\nRange: bytes=0-"),
+        "download request must send a title-cased Range header, got:\n{request}"
+    );
+    assert!(
+        !request.contains("\r\nrange:"),
+        "lowercase range header is ignored by the live server, got:\n{request}"
+    );
+}
+
+#[tokio::test]
 async fn download_html_response_is_not_written_to_disk() {
     let server = MockServer::start().await;
     mount_page(&server, include_str!("fixtures/single_basic.html")).await;
@@ -1357,6 +1397,36 @@ fn start_raw_mismatch_server(
         }
     });
     format!("http://{addr}")
+}
+
+fn start_header_capture_server(
+    page_body: Vec<u8>,
+    file_body: Vec<u8>,
+) -> (String, Arc<Mutex<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(String::new()));
+    let captured_writer = Arc::clone(&captured);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            if request.starts_with(&format!("GET /{FILE_ID} ")) {
+                write_response(&mut stream, "text/html", page_body.len(), &page_body);
+            } else {
+                *captured_writer.lock().unwrap() = request.clone();
+                write_response(
+                    &mut stream,
+                    "application/octet-stream",
+                    file_body.len(),
+                    &file_body,
+                );
+            }
+        }
+    });
+    (format!("http://{addr}"), captured)
 }
 
 fn write_response(stream: &mut std::net::TcpStream, content_type: &str, len: usize, body: &[u8]) {
