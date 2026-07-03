@@ -7,6 +7,14 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-03
+
+### Changed
+
+- Rename the crate and binary from `gfile` to `rgfile`.
+- Rename the repository to `gigafile-rust-cli`.
+- Rewrite the README to present the project on its own terms.
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
