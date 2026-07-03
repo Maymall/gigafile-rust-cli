@@ -1,0 +1,20 @@
+---
+source: tests/cli_json.rs
+expression: stdout
+---
+Show metadata for a public GigaFile page without downloading files
+
+Usage: rgfile info [OPTIONS] <URL>
+
+Arguments:
+  <URL>  Download page URL
+
+Options:
+      --timeout <TIMEOUT>        Per-request timeout in seconds [default: 60]
+  -v, --verbose...               Increase logging verbosity (-v for info, -vv for debug)
+      --retries <RETRIES>        Retry count for retryable network/server failures [default: 3]
+      --user-agent <USER_AGENT>  Override the default User-Agent
+      --dump-page <DUMP_PAGE>    Save the fetched download page HTML for diagnostics
+      --json                     Print one JSON object
+  -q, --quiet                    Disable non-error status output
+  -h, --help                     Print help

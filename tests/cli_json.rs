@@ -55,6 +55,20 @@ fn snapshot_upload_help() {
     insta::assert_snapshot!(normalize_help(&output.stdout));
 }
 
+#[test]
+fn snapshot_info_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["info", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = normalize_help(&output.stdout);
+    assert!(!stdout.contains("GFILE_TEST_ALLOW_ANY_HOST"));
+    insta::assert_snapshot!(stdout);
+}
+
 #[tokio::test]
 async fn snapshot_json_single_success() {
     let server = MockServer::start().await;
@@ -221,6 +235,8 @@ async fn snapshot_json_upload_success() {
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": 0,
                 "url": upload_url,
+                "delkey": "EXAMPLE-DELKEY-0000",
+                "filename": "example file.bin",
             }))
         })
         .mount(&server)
@@ -235,6 +251,38 @@ async fn snapshot_json_upload_success() {
         .env("GFILE_TEST_ENTRY_URL", server.uri())
         .args(["upload", "--json", "--no-verify"])
         .arg(file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    insta::assert_snapshot!(normalize_json(&output.stdout));
+}
+
+#[tokio::test]
+async fn snapshot_json_info_single() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["info", "--json", &format!("{}/{FILE_ID}", server.uri())])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    insta::assert_snapshot!(normalize_json(&output.stdout));
+}
+
+#[tokio::test]
+async fn snapshot_json_info_needs_key() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/page_needs_key.html")).await;
+
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .args(["info", "--json", &format!("{}/{FILE_ID}", server.uri())])
         .output()
         .unwrap();
 
@@ -289,6 +337,15 @@ fn redact_paths(value: &mut Value) {
             }
             if map.contains_key("url") {
                 map.insert("url".to_owned(), Value::String("<URL>".to_owned()));
+            }
+            if map.contains_key("delkey") {
+                map.insert("delkey".to_owned(), Value::String("<DELKEY>".to_owned()));
+            }
+            if map.contains_key("expires_at_estimate") {
+                map.insert(
+                    "expires_at_estimate".to_owned(),
+                    Value::String("<EXPIRES_AT>".to_owned()),
+                );
             }
             for value in map.values_mut() {
                 redact_paths(value);

@@ -4,7 +4,10 @@ expression: normalize_json(&output.stdout)
 ---
 {
   "bytes": 5,
+  "delkey": "<DELKEY>",
+  "expires_at_estimate": "<EXPIRES_AT>",
   "lifetime": 100,
+  "remote_filename": "example file.bin",
   "status": "ok",
   "url": "<URL>",
   "verified": null

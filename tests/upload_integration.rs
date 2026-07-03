@@ -33,6 +33,14 @@ async fn upload_sends_expected_multipart_fields() {
     let report = upload(options(&server, file, true, 0)).await.unwrap();
 
     assert_eq!(report.bytes, 12);
+    assert_eq!(report.delkey.as_deref(), Some("EXAMPLE-DELKEY-0000"));
+    assert_eq!(report.remote_filename.as_deref(), Some("example file.bin"));
+    assert!(
+        report
+            .expires_at_estimate
+            .as_deref()
+            .is_some_and(is_iso_8601_utc)
+    );
     assert_eq!(report.verified, None);
     let requests = upload_requests(&server).await;
     assert_eq!(requests.len(), 1);
@@ -47,6 +55,33 @@ async fn upload_sends_expected_multipart_fields() {
     assert!(String::from_utf8_lossy(body).contains("name=\"file\""));
     assert!(String::from_utf8_lossy(body).contains("filename=\"blob\""));
     assert!(body_contains(body, b"hello upload"));
+}
+
+#[tokio::test]
+async fn upload_allows_missing_delkey_and_filename() {
+    let server = MockServer::start().await;
+    mount_landing(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/upload_chunk.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": 0,
+            "url": format!("{}/{FILE_ID}", server.uri())
+        })))
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let file = write_file(&temp, "missing-optional.bin", b"hello");
+
+    let report = upload(options(&server, file, true, 0)).await.unwrap();
+
+    assert_eq!(report.delkey, None);
+    assert_eq!(report.remote_filename, None);
+    assert!(
+        report
+            .expires_at_estimate
+            .as_deref()
+            .is_some_and(is_iso_8601_utc)
+    );
 }
 
 #[tokio::test]
@@ -390,6 +425,22 @@ fn multipart_text_field(body: &[u8], name: &str) -> String {
 
 fn body_contains(body: &[u8], needle: &[u8]) -> bool {
     body.windows(needle.len()).any(|window| window == needle)
+}
+
+fn is_iso_8601_utc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'Z'
+        && bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index, 4 | 7 | 10 | 13 | 16 | 19))
+            .all(|(_, byte)| byte.is_ascii_digit())
 }
 
 fn upload_success_json(url: &str) -> serde_json::Value {

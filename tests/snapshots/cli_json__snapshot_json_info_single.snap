@@ -1,0 +1,17 @@
+---
+source: tests/cli_json.rs
+expression: normalize_json(&output.stdout)
+---
+{
+  "files": [
+    {
+      "approx_bytes": 10240,
+      "display_name": "example file.bin",
+      "display_name_may_be_masked": true,
+      "display_size": "10KB"
+    }
+  ],
+  "key_required": false,
+  "kind": "single",
+  "status": "ok"
+}

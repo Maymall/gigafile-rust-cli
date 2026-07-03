@@ -193,15 +193,53 @@ fn io_message(source: &io::Error, path: &std::path::Path, op: IoOp) -> String {
 
 fn sanitize_message(value: &str) -> String {
     let mut output = value.to_owned();
-    while let Some(start) = output.find("dlkey=") {
-        let value_start = start + "dlkey=".len();
+    redact_assignment(&mut output, "dlkey=", "redacted-download-key");
+    redact_assignment(&mut output, "delkey=", "redacted-delete-key");
+    redact_assignment(&mut output, "delete_key=", "redacted-delete-key");
+    redact_json_string_field(&mut output, "delkey");
+    redact_json_string_field(&mut output, "delete_key");
+    output
+}
+
+fn redact_assignment(output: &mut String, marker: &str, replacement: &str) {
+    while let Some(start) = output.find(marker) {
+        let value_start = start + marker.len();
         let value_end = output[value_start..]
-            .find('&')
+            .find(|ch: char| ch == '&' || ch.is_ascii_whitespace())
             .map(|offset| value_start + offset)
             .unwrap_or(output.len());
-        output.replace_range(start..value_end, "redacted-download-key");
+        output.replace_range(start..value_end, replacement);
     }
-    output
+}
+
+fn redact_json_string_field(output: &mut String, field: &str) {
+    let marker = format!("\"{field}\"");
+    let mut search_from = 0;
+    while let Some(relative) = output[search_from..].find(&marker) {
+        let field_start = search_from + relative;
+        let Some(colon_relative) = output[field_start + marker.len()..].find(':') else {
+            break;
+        };
+        let colon = field_start + marker.len() + colon_relative;
+        let value_start = colon
+            + 1
+            + output[colon + 1..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+        if !output[value_start..].starts_with('"') {
+            search_from = value_start;
+            continue;
+        }
+        let content_start = value_start + 1;
+        let Some(content_end_relative) = output[content_start..].find('"') else {
+            break;
+        };
+        let content_end = content_start + content_end_relative;
+        output.replace_range(content_start..content_end, "***");
+        search_from = content_start + 3;
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +260,22 @@ mod tests {
             assert!(!message.trim().is_empty());
             assert!(!message.contains("dlkey="), "{message}");
         }
+    }
+
+    #[test]
+    fn user_message_redacts_upload_delete_keys() {
+        let error = GfileError::UploadRejected {
+            detail: r#"response {"delkey":"EXAMPLE-DELKEY-0000","delete_key":"EXAMPLE-DELETE-0000"} delkey=EXAMPLE-DELKEY-0000"#.to_owned(),
+            status: None,
+            retryable: false,
+        };
+
+        let message = error.user_message();
+
+        assert!(!message.contains("EXAMPLE-DELKEY-0000"), "{message}");
+        assert!(!message.contains("EXAMPLE-DELETE-0000"), "{message}");
+        assert!(message.contains(r#""delkey":"***""#), "{message}");
+        assert!(message.contains("redacted-delete-key"), "{message}");
     }
 
     fn error_cases() -> Vec<(GfileError, u8)> {

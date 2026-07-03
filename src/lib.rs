@@ -6,6 +6,7 @@ pub mod cli;
 pub mod download;
 pub mod error;
 pub mod http;
+pub mod info;
 pub mod jsonout;
 pub mod naming;
 pub mod parser;

@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::{
     download::{DownloadFileRecord, DownloadReport},
     error::GfileError,
+    info::{InfoFileRecord, InfoReport},
     parser::download::PageKind,
     upload::UploadReport,
 };
@@ -49,9 +50,22 @@ pub fn print_upload_report(report: &UploadReport) -> Result<(), GfileError> {
     let json = UploadReportJson {
         status: "ok",
         url: &report.url,
+        delkey: report.delkey.as_deref(),
+        remote_filename: report.remote_filename.as_deref(),
+        expires_at_estimate: report.expires_at_estimate.as_deref(),
         bytes: report.bytes,
         lifetime: report.lifetime,
         verified: report.verified,
+    };
+    print_json(&json)
+}
+
+pub fn print_info_report(report: &InfoReport) -> Result<(), GfileError> {
+    let json = InfoReportJson {
+        status: "ok",
+        kind: kind_name(report.kind),
+        key_required: report.key_required,
+        files: report.files.iter().map(info_file_json).collect(),
     };
     print_json(&json)
 }
@@ -90,9 +104,28 @@ struct ErrorEnvelope {
 struct UploadReportJson<'a> {
     status: &'static str,
     url: &'a str,
+    delkey: Option<&'a str>,
+    remote_filename: Option<&'a str>,
+    expires_at_estimate: Option<&'a str>,
     bytes: u64,
     lifetime: u16,
     verified: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct InfoReportJson<'a> {
+    status: &'static str,
+    kind: &'static str,
+    key_required: bool,
+    files: Vec<InfoFileJson<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct InfoFileJson<'a> {
+    display_name: &'a str,
+    display_name_may_be_masked: bool,
+    display_size: Option<&'a str>,
+    approx_bytes: Option<u64>,
 }
 
 fn download_file_json(file: &DownloadFileRecord) -> DownloadFileJson<'_> {
@@ -102,6 +135,15 @@ fn download_file_json(file: &DownloadFileRecord) -> DownloadFileJson<'_> {
         bytes: file.bytes,
         resumed: file.resumed,
         error: file.error.clone(),
+    }
+}
+
+fn info_file_json(file: &InfoFileRecord) -> InfoFileJson<'_> {
+    InfoFileJson {
+        display_name: &file.display_name,
+        display_name_may_be_masked: true,
+        display_size: file.display_size.as_deref(),
+        approx_bytes: file.approx_bytes,
     }
 }
 

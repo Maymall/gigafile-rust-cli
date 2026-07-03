@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::TryStreamExt;
@@ -90,6 +90,9 @@ impl Default for UploadOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadReport {
     pub url: String,
+    pub delkey: Option<String>,
+    pub remote_filename: Option<String>,
+    pub expires_at_estimate: Option<String>,
     pub bytes: u64,
     pub lifetime: u16,
     pub verified: Option<bool>,
@@ -210,6 +213,8 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
     let upload_id = Uuid::new_v4().simple().to_string();
     let progress = ByteProgress::new(Some(file_plan.size), options.quiet, &file_plan.file_name);
     let mut uploaded_url = None;
+    let mut delkey = None;
+    let mut remote_filename = None;
     let mut confirmed_bytes = 0;
     let chunk_context = ChunkUploadContext {
         client: &client,
@@ -223,6 +228,11 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
 
     for chunk in &file_plan.chunks {
         let response = send_chunk_with_retries(&chunk_context, *chunk, confirmed_bytes).await?;
+        debug!(
+            chunk = chunk.index,
+            response = %redact_upload_response(&response),
+            "upload chunk response"
+        );
         if let Some(status) = response.get("status") {
             debug!(?status, chunk = chunk.index, "upload chunk status field");
         }
@@ -238,6 +248,8 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
                     retryable: false,
                 });
             }
+            delkey = optional_response_string(&response, "delkey");
+            remote_filename = optional_response_string(&response, "filename");
         }
         confirmed_bytes += chunk.len;
         progress.set_position(confirmed_bytes);
@@ -245,6 +257,7 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
     progress.finish();
 
     let url = uploaded_url.expect("final chunk URL checked above");
+    let expires_at_estimate = estimate_expires_at(SystemTime::now(), options.lifetime);
     let verified = if options.verify {
         verify_uploaded_file(&client, &url, file_plan.size, &options).await?
     } else {
@@ -253,6 +266,9 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
 
     Ok(UploadReport {
         url,
+        delkey,
+        remote_filename,
+        expires_at_estimate,
         bytes: file_plan.size,
         lifetime: options.lifetime,
         verified,
@@ -648,6 +664,71 @@ fn upload_retryable(error: &GfileError) -> bool {
     }
 }
 
+fn optional_response_string(response: &Value, key: &str) -> Option<String> {
+    response
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn redact_upload_response(response: &Value) -> String {
+    let mut redacted = response.clone();
+    redact_value_key(&mut redacted, "delkey");
+    redact_value_key(&mut redacted, "delete_key");
+    redacted.to_string()
+}
+
+fn redact_value_key(value: &mut Value, key: &str) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key(key) {
+                map.insert(key.to_owned(), Value::String("***".to_owned()));
+            }
+            for nested in map.values_mut() {
+                redact_value_key(nested, key);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                redact_value_key(nested, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn estimate_expires_at(now: SystemTime, lifetime_days: u16) -> Option<String> {
+    let expires = now.checked_add(Duration::from_secs(u64::from(lifetime_days) * 86_400))?;
+    let seconds = expires.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(format_unix_utc(seconds))
+}
+
+fn format_unix_utc(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
+}
+
 fn usage(message: &str) -> GfileError {
     GfileError::Usage {
         message: message.to_owned(),
@@ -723,5 +804,29 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn upload_response_redaction_hides_delkey_fields() {
+        let value = serde_json::json!({
+            "status": 0,
+            "url": "https://23.gigafile.nu/0123abcd-000000example",
+            "delkey": "EXAMPLE-DELKEY-0000",
+            "nested": { "delete_key": "EXAMPLE-DELETE-0000" }
+        });
+
+        let redacted = redact_upload_response(&value);
+
+        assert!(!redacted.contains("EXAMPLE-DELKEY-0000"));
+        assert!(!redacted.contains("EXAMPLE-DELETE-0000"));
+        assert!(redacted.contains("\"delkey\":\"***\""));
+        assert!(redacted.contains("\"delete_key\":\"***\""));
+    }
+
+    #[test]
+    fn unix_utc_formatting_is_iso_8601() {
+        assert_eq!(format_unix_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_unix_utc(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(format_unix_utc(1_704_067_199), "2023-12-31T23:59:59Z");
     }
 }

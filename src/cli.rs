@@ -5,7 +5,7 @@ use std::{env, path::PathBuf, time::Duration};
 use clap::{ArgAction, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::{download, error::GfileError, jsonout, upload};
+use crate::{download, error::GfileError, info, jsonout, upload};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -72,6 +72,35 @@ pub enum Commands {
         json: bool,
 
         /// Disable progress and non-error status output.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+    },
+    /// Show metadata for a public GigaFile page without downloading files.
+    Info {
+        /// Download page URL.
+        url: String,
+
+        /// Per-request timeout in seconds.
+        #[arg(long = "timeout", default_value_t = 60)]
+        timeout: u64,
+
+        /// Retry count for retryable network/server failures.
+        #[arg(long = "retries", default_value_t = 3)]
+        retries: u32,
+
+        /// Override the default User-Agent.
+        #[arg(long = "user-agent")]
+        user_agent: Option<String>,
+
+        /// Save the fetched download page HTML for diagnostics.
+        #[arg(long = "dump-page")]
+        dump_page: Option<PathBuf>,
+
+        /// Print one JSON object.
+        #[arg(long = "json")]
+        json: bool,
+
+        /// Disable non-error status output.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
     },
@@ -191,6 +220,42 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                 Err(error) => Err(error),
             }
         }
+        Commands::Info {
+            url,
+            timeout,
+            retries,
+            user_agent,
+            dump_page,
+            json,
+            quiet,
+        } => {
+            let result = info::info(info::InfoOptions {
+                url,
+                timeout: Duration::from_secs(timeout),
+                retries,
+                user_agent,
+                dump_page,
+                allow_any_host: test_allow_any_host(),
+            })
+            .await;
+
+            match result {
+                Ok(report) => {
+                    if json {
+                        jsonout::print_info_report(&report)?;
+                    } else if !quiet {
+                        print_human_info_report(&report);
+                    }
+                    Ok(RunOutcome::Success)
+                }
+                Err(error) if json => {
+                    let code = error.exit_code();
+                    jsonout::print_error(&error)?;
+                    Ok(RunOutcome::Failure(code))
+                }
+                Err(error) => Err(error),
+            }
+        }
         Commands::Upload {
             file,
             lifetime,
@@ -223,7 +288,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                     if json {
                         jsonout::print_upload_report(&report)?;
                     } else if !quiet {
-                        println!("{}", report.url);
+                        print_human_upload_report(&report);
                         if report.verified == Some(true) {
                             eprintln!("Verified upload size: {} bytes", report.bytes);
                         } else if report.verified.is_none() && !no_verify {
@@ -257,6 +322,41 @@ fn print_human_download_report(report: &download::DownloadReport) {
             (_, Some(error)) => println!("error\t{}\t{}", file.name, error.code),
             _ => println!("error\t{}\tunknown", file.name),
         }
+    }
+}
+
+fn print_human_info_report(report: &info::InfoReport) {
+    println!("kind\t{}", page_kind_name(report.kind));
+    println!("key_required\t{}", report.key_required);
+    for file in &report.files {
+        println!("display_name (may be masked)\t{}", file.display_name);
+        if let Some(size) = &file.display_size {
+            println!("display_size\t{size}");
+        }
+        if let Some(bytes) = file.approx_bytes {
+            println!("approx_bytes\t{bytes}");
+        }
+    }
+}
+
+fn print_human_upload_report(report: &upload::UploadReport) {
+    println!("{}", report.url);
+    if let Some(delkey) = &report.delkey {
+        println!("delete_key={delkey}");
+        eprintln!("Warning: save this delete key; it is required to delete the uploaded file.");
+    }
+    if let Some(filename) = &report.remote_filename {
+        println!("remote_filename={filename}");
+    }
+    if let Some(expires_at) = &report.expires_at_estimate {
+        println!("expires_at_estimate={expires_at}");
+    }
+}
+
+fn page_kind_name(kind: crate::parser::download::PageKind) -> &'static str {
+    match kind {
+        crate::parser::download::PageKind::Single => "single",
+        crate::parser::download::PageKind::Matomete => "matomete",
     }
 }
 

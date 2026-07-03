@@ -13,7 +13,7 @@ use wiremock::{
 const FILE_ID: &str = "0123abcd-000000example";
 
 #[tokio::test]
-async fn cli_upload_success_prints_url() {
+async fn cli_upload_success_prints_url_and_delete_key() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     mount_upload(&server, Some(format!("{}/{FILE_ID}", server.uri()))).await;
@@ -31,7 +31,30 @@ async fn cli_upload_success_prints_url() {
         .stdout(predicate::str::contains(format!(
             "{}/{FILE_ID}",
             server.uri()
-        )));
+        )))
+        .stdout(predicate::str::contains("delete_key=EXAMPLE-DELKEY-0000"))
+        .stderr(predicate::str::contains("save this delete key"));
+}
+
+#[tokio::test]
+async fn cli_upload_verbose_log_redacts_delete_key() {
+    let server = MockServer::start().await;
+    mount_landing(&server).await;
+    mount_upload(&server, Some(format!("{}/{FILE_ID}", server.uri()))).await;
+    let temp = TempDir::new().unwrap();
+    let file = write_file(&temp, "verbose.bin", b"hello");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .env("GFILE_TEST_ENTRY_URL", server.uri())
+        .args(["-vv", "upload", "--no-verify"])
+        .arg(file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("delete_key=EXAMPLE-DELKEY-0000"))
+        .stderr(predicate::str::contains("\"delkey\":\"***\""))
+        .stderr(predicate::str::contains("EXAMPLE-DELKEY-0000").not());
 }
 
 #[tokio::test]
@@ -123,7 +146,12 @@ async fn mount_upload(server: &MockServer, url: Option<String>) {
         .and(path("/upload_chunk.php"))
         .respond_with(move |_request: &Request| {
             let body = if let Some(url) = &url {
-                serde_json::json!({ "status": 0, "url": url })
+                serde_json::json!({
+                    "status": 0,
+                    "url": url,
+                    "delkey": "EXAMPLE-DELKEY-0000",
+                    "filename": "example file.bin"
+                })
             } else {
                 serde_json::json!({ "status": 0 })
             };

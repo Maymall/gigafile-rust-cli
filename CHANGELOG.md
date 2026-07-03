@@ -7,6 +7,11 @@ Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Include upload delete keys, remote filenames, and estimated expiration timestamps in upload results.
+- Add `rgfile info` to inspect GigaFile pages without downloading file bodies.
+
 ## [0.3.1] - 2026-07-03
 
 ### Changed
