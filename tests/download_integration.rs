@@ -227,6 +227,77 @@ async fn download_content_disposition_overrides_masked_page_name() {
 }
 
 #[tokio::test]
+async fn download_resume_uses_content_disposition_name_for_masked_page() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_masked.html")).await;
+    let body = binary_body(4096);
+    let partial = 1024_u64;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("real-name.bin");
+    let part_path = temp.path().join("real-name.bin.part");
+    let sidecar_path = temp.path().join("real-name.bin.part.json");
+    std::fs::write(&part_path, &body[..partial as usize]).unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(body.len() as u64), false);
+    let full_requests = Arc::new(AtomicUsize::new(0));
+    let range_starts = Arc::new(Mutex::new(Vec::new()));
+    let responder_full_requests = Arc::clone(&full_requests);
+    let responder_range_starts = Arc::clone(&range_starts);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some(start) = open_ended_range_start(request) {
+                responder_range_starts.lock().unwrap().push(start);
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "Content-Range",
+                        format!(
+                            "bytes {start}-{}/{}",
+                            responder_body.len() - 1,
+                            responder_body.len()
+                        ),
+                    )
+                    .insert_header(
+                        "Content-Length",
+                        (responder_body.len() as u64 - start).to_string(),
+                    )
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .insert_header(
+                        "Content-Disposition",
+                        "attachment; filename*=UTF-8''real-name.bin",
+                    )
+                    .set_body_bytes(responder_body[start as usize..].to_vec())
+            } else {
+                responder_full_requests.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", responder_body.len().to_string())
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .insert_header(
+                        "Content-Disposition",
+                        "attachment; filename*=UTF-8''real-name.bin",
+                    )
+                    .set_body_bytes(responder_body.clone())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert!(outcome.resumed);
+    assert_eq!(outcome.path.as_ref(), Some(&final_path));
+    assert_eq!(std::fs::read(&final_path).unwrap(), body);
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+    assert!(!temp.path().join("______.bin.part").exists());
+    assert!(!temp.path().join("______.bin.part.json").exists());
+    assert_eq!(full_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(range_starts.lock().unwrap().as_slice(), &[partial]);
+}
+
+#[tokio::test]
 async fn download_size_mismatch_keeps_part_file() {
     let body = binary_body(10 * 1024);
     let server_uri = start_raw_mismatch_server(
@@ -477,6 +548,88 @@ async fn download_threads_uses_content_disposition_from_first_206() {
         "テスト資料_2026.bin".as_bytes()
     );
     assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
+}
+
+#[tokio::test]
+async fn download_threads_resumes_masked_page_from_content_disposition_name() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_masked.html")).await;
+    let body = binary_body(16 * 1024);
+    let initial_end = 1023;
+    let ranges = expected_ranges_after_initial(body.len() as u64, 4, initial_end);
+    let partial = 512_u64;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("real-name.bin");
+    let part_path = temp.path().join("real-name.bin.part");
+    let sidecar_path = temp.path().join("real-name.bin.part.json");
+    std::fs::write(&part_path, vec![0_u8; body.len()]).unwrap();
+    write_body_range(&part_path, &body, ranges[0].0, ranges[0].1).unwrap();
+    write_body_range(&part_path, &body, ranges[1].0, ranges[1].0 + partial - 1).unwrap();
+    write_segment_sidecar(
+        &sidecar_path,
+        FILE_ID,
+        body.len() as u64,
+        false,
+        &[
+            (
+                ranges[0].0,
+                ranges[0].1,
+                true,
+                ranges[0].1 - ranges[0].0 + 1,
+            ),
+            (ranges[1].0, ranges[1].1, false, partial),
+            (ranges[2].0, ranges[2].1, false, 0),
+            (ranges[3].0, ranges[3].1, false, 0),
+        ],
+    );
+    let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+    let non_range_requests = Arc::new(AtomicUsize::new(0));
+    let responder_ranges = Arc::clone(&observed_ranges);
+    let responder_non_ranges = Arc::clone(&non_range_requests);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some((start, end)) = range_header(request) {
+                responder_ranges.lock().unwrap().push((start, end));
+                range_response(&responder_body, start, end).insert_header(
+                    "Content-Disposition",
+                    "attachment; filename*=UTF-8''real-name.bin",
+                )
+            } else {
+                responder_non_ranges.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut opts = options(&server, &temp, 0);
+    opts.threads = 4;
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert!(outcome.resumed);
+    assert_eq!(outcome.threads, Some(4));
+    assert_eq!(outcome.path.as_ref(), Some(&final_path));
+    assert_eq!(std::fs::read(&final_path).unwrap(), body);
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+    assert!(!temp.path().join("______.bin.part").exists());
+    assert!(!temp.path().join("______.bin.part.json").exists());
+
+    let mut observed = observed_ranges.lock().unwrap().clone();
+    observed.sort_unstable();
+    let mut expected = vec![
+        ranges[0],
+        (ranges[1].0 + partial, ranges[1].1),
+        ranges[2],
+        ranges[3],
+    ];
+    expected.sort_unstable();
+    assert_eq!(observed, expected);
+    assert_eq!(non_range_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1550,6 +1703,15 @@ fn range_header(request: &Request) -> Option<(u64, u64)> {
     let value = value.strip_prefix("bytes=")?;
     let (start, end) = value.split_once('-')?;
     Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+fn open_ended_range_start(request: &Request) -> Option<u64> {
+    let value = request.headers.get("range")?.to_str().ok()?;
+    value
+        .strip_prefix("bytes=")?
+        .strip_suffix('-')?
+        .parse()
+        .ok()
 }
 
 fn range_response(body: &[u8], start: u64, end: u64) -> ResponseTemplate {

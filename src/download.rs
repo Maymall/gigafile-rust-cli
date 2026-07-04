@@ -17,7 +17,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     error::{BoxError, GfileError, IoOp},
@@ -168,6 +168,13 @@ struct InitialSegmentResponse {
     index: usize,
     range_start: u64,
     response: reqwest::Response,
+}
+
+struct SequentialDownloadPlan {
+    response: reqwest::Response,
+    target_path: PathBuf,
+    header_output_dir: Option<PathBuf>,
+    resume: ResumePlan,
 }
 
 #[derive(Debug, Clone)]
@@ -534,26 +541,34 @@ async fn try_download_file_sequential(
     }
 
     consume_download_response_sequential(
-        response,
+        client,
         download_url,
         remote_file,
-        target_path,
-        header_output_dir,
-        resume,
+        SequentialDownloadPlan {
+            response,
+            target_path,
+            header_output_dir,
+            resume,
+        },
         options,
     )
     .await
 }
 
 async fn consume_download_response_sequential(
-    response: reqwest::Response,
+    client: &reqwest::Client,
     download_url: &str,
     remote_file: &RemoteFile,
-    mut target_path: PathBuf,
-    header_output_dir: Option<PathBuf>,
-    mut resume: ResumePlan,
+    plan: SequentialDownloadPlan,
     options: &DownloadOptions,
 ) -> Result<SingleDownloadOutcome, GfileError> {
+    let SequentialDownloadPlan {
+        mut response,
+        mut target_path,
+        header_output_dir,
+        mut resume,
+    } = plan;
+
     if !response.status().is_success() {
         return Err(http::status_error(response.status(), download_url));
     }
@@ -577,10 +592,32 @@ async fn consume_download_response_sequential(
             if header_path != target_path {
                 ensure_target_available(&header_path, options.force)?;
                 let lock = DownloadLock::acquire(&header_path)?;
+                let header_resume = prepare_resume(&header_path, remote_file, options).await?;
+                let should_retry_with_header_resume = header_resume.range_start.is_some();
                 target_path = header_path;
-                let (part_path, sidecar_path) = part_paths(&target_path)?;
-                resume.part_path = part_path;
-                resume.sidecar_path = sidecar_path;
+                resume = header_resume;
+                if should_retry_with_header_resume {
+                    response =
+                        send_download_request(client, download_url, resume.range_start, options)
+                            .await?;
+                    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+                        if let Some(outcome) =
+                            complete_if_range_already_finished(&resume, &target_path, options)
+                                .await?
+                        {
+                            return Ok(outcome);
+                        }
+                        warn!(
+                            "server rejected resume range before expected size; restarting from zero"
+                        );
+                        remove_if_exists(&resume.part_path).await?;
+                        remove_if_exists(&resume.sidecar_path).await?;
+                        resume.range_start = None;
+                        resume.expected = None;
+                        response =
+                            send_download_request(client, download_url, None, options).await?;
+                    }
+                }
                 Some(lock)
             } else {
                 None
@@ -592,13 +629,28 @@ async fn consume_download_response_sequential(
         None
     };
 
+    if !response.status().is_success() {
+        return Err(http::status_error(response.status(), download_url));
+    }
+
+    if is_html_content_type(response.headers()) {
+        let body = response
+            .text()
+            .await
+            .map_err(|source| network_error(source, "reading HTML download error body"))?;
+        return Err(classify_html_response(
+            &body,
+            options.key.is_some(),
+            "download response content-type is HTML",
+        ));
+    }
+
     let transfer = transfer_plan(&response, &resume)?;
     if transfer.expected_total.is_none() {
         warn!("download response has no Content-Length; exact size check is disabled");
     }
     warn_on_display_size_mismatch(remote_file, transfer.expected_total);
 
-    let mut response = response;
     let first_chunk = match next_chunk(&mut response, options.timeout).await {
         Ok(chunk) => chunk,
         Err(ChunkReadError::Timeout) => {
@@ -764,6 +816,7 @@ async fn try_download_file_segmented_fresh(
         );
         return consume_200_fallback_response(
             response,
+            client,
             download_url,
             remote_file,
             final_path,
@@ -834,6 +887,22 @@ async fn try_download_file_segmented_fresh(
         } else {
             None
         };
+
+    if let Some(segment_resume) =
+        load_existing_segmented_resume(&target_path, remote_file, options).await?
+    {
+        // The probe response was only needed to discover Content-Disposition.
+        // Keep resumed writes on the existing resume path to avoid truncating the true-name .part.
+        return try_download_file_segmented_resume(
+            client,
+            download_url,
+            remote_file,
+            &target_path,
+            segment_resume,
+            options,
+        )
+        .await;
+    }
 
     let (part_path, sidecar_path) = part_paths(&target_path)?;
     let segments = build_segments_from_initial(expected, options.threads, content_range.end);
@@ -919,6 +988,7 @@ async fn try_download_file_segmented_resume(
         remove_if_exists(&segment_resume.sidecar_path).await?;
         return consume_200_fallback_response(
             response,
+            client,
             download_url,
             remote_file,
             final_path,
@@ -998,6 +1068,7 @@ async fn try_download_file_segmented_resume(
 
 async fn consume_200_fallback_response(
     response: reqwest::Response,
+    client: &reqwest::Client,
     download_url: &str,
     remote_file: &RemoteFile,
     final_path: &Path,
@@ -1010,12 +1081,15 @@ async fn consume_200_fallback_response(
         header_filename_output_dir(final_path, sequential_options.output.as_deref())?;
     let resume = fresh_resume_plan(final_path)?;
     consume_download_response_sequential(
-        response,
+        client,
         download_url,
         remote_file,
-        final_path.to_owned(),
-        header_output_dir,
-        resume,
+        SequentialDownloadPlan {
+            response,
+            target_path: final_path.to_owned(),
+            header_output_dir,
+            resume,
+        },
         &sequential_options,
     )
     .await
@@ -1425,6 +1499,10 @@ async fn load_existing_segmented_resume(
     }
 
     if !part_path.exists() {
+        debug!(
+            path = %part_path.display(),
+            "looked for existing segmented .part, not found"
+        );
         return Ok(None);
     }
 

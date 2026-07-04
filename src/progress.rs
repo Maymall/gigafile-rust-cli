@@ -24,7 +24,7 @@ impl ByteProgress {
 
         let bar = ProgressBar::new(total);
         let style = ProgressStyle::with_template(
-            "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+            "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=> ");

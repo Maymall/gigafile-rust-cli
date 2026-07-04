@@ -7,6 +7,13 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-04
+
+### Fixed
+
+- Resume sequential and segmented downloads when a masked page display name is replaced by a Content-Disposition filename.
+- Use second-precise ETA on single-bar download and upload progress.
+
 ## [0.7.0] - 2026-07-04
 
 ### Added
