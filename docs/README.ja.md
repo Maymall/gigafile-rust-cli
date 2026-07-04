@@ -106,4 +106,4 @@ MIT — [LICENSE](../LICENSE) を参照。
 GigaFile.nu のプロトコルの流れは
 [`Sraq-Zit/gfile`](https://github.com/Sraq-Zit/gfile) と
 そのフォーク [`fireattack/gfile`](https://github.com/fireattack/gfile)
-を参考にさせてもらいました。感謝！
+を参考にさせていただきました。

@@ -30,11 +30,11 @@ rgfile ul file.bin --lifetime 7      # 保存 7 天（3–100）
 
 rgfile dl <url>                      # 下载；中断后重跑即续传
 rgfile dl <url> --threads 8          # 多连接分段下载
-rgfile dl <url> --select 1,3-5       # 从多文件页面挑着下
+rgfile dl <url> --select 1,3-5       # 从多文件页面中选择下载
 
 rgfile info <url>                    # 只看信息，不下载
 rgfile delete <url>                  # 用删除密钥撤下分享
-rgfile parts list                    # 查看半成品下载
+rgfile parts list                    # 列出未完成的下载
 rgfile parts clean --older-than 7    # 清理旧残留；活跃下载绝不误删
 
 rgfile config init                   # 交互式配置
@@ -68,7 +68,7 @@ store_delete_keys = false      # 明文存储，须显式开启
 
 - 下载从中断处继续，页面显示掩码文件名时同样有效；完成是原子的并校验大小。
   文件名取自 `Content-Disposition`，UTF-8 / 日文名完整保留。
-- 分段下载只保持少量活跃连接，服务器拒绝时自动退避，不硬怼。
+- 分段下载只保持少量活跃连接，收到服务器拒绝时自动退避。
 - Ctrl-C 会打印已落盘的进度和续传方法。删除密钥和下载密码不会出现在任何日志里。
 - 上传流式进行、按块重试；块严格按序完成——实测服务器会丢弃乱序到达的块。
 - rgfile 不绕过 GigaFile 的限制、不猜密码、不批量抓链接。
@@ -101,4 +101,4 @@ MIT，见 [LICENSE](../LICENSE)。
 
 GigaFile.nu 的协议流程最初参考了
 [`Sraq-Zit/gfile`](https://github.com/Sraq-Zit/gfile)
-及其 fork [`fireattack/gfile`](https://github.com/fireattack/gfile)，谢过！
+及其 fork [`fireattack/gfile`](https://github.com/fireattack/gfile)，在此致谢。
