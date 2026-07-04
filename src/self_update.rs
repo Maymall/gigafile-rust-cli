@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    error::{BoxError, GfileError, IoOp},
+    error::{GfileError, IoOp, boxed},
     http,
 };
 
@@ -364,10 +364,6 @@ fn read_archive_error(source: impl std::error::Error + Send + Sync + 'static) ->
         what: format!("failed to read release archive: {source}"),
         hint: "The downloaded release archive may be corrupt; retry later.".to_owned(),
     }
-}
-
-fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> BoxError {
-    Box::new(error)
 }
 
 struct WorkDir {

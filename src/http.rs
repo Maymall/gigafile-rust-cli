@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    error::Error,
     io,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +10,7 @@ use reqwest::{Client, Response, redirect::Policy};
 use tokio::time::sleep;
 use tracing::warn;
 
-use crate::error::{BoxError, GfileError};
+use crate::error::{GfileError, boxed};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REDIRECT_LIMIT: usize = 5;
@@ -156,10 +155,6 @@ fn jitter_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::from(duration.subsec_millis() % 501))
         .unwrap_or(0)
-}
-
-fn boxed(error: impl Error + Send + Sync + 'static) -> BoxError {
-    Box::new(error)
 }
 
 #[cfg(test)]

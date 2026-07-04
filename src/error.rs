@@ -4,12 +4,47 @@ use std::{
     error::Error,
     fmt,
     io::{self, ErrorKind},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use thiserror::Error;
 
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+pub(crate) fn boxed(error: impl Error + Send + Sync + 'static) -> BoxError {
+    Box::new(error)
+}
+
+pub(crate) fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
+    GfileError::Io {
+        source,
+        path: path.to_owned(),
+        op,
+    }
+}
+
+pub(crate) fn network_error(
+    source: impl Error + Send + Sync + 'static,
+    context: &str,
+) -> GfileError {
+    GfileError::Network {
+        source: boxed(source),
+        context: context.to_owned(),
+    }
+}
+
+pub(crate) fn internal_error(what: impl Into<String>) -> GfileError {
+    GfileError::Parse {
+        what: what.into(),
+        hint: "This is an internal state error; please report it.".to_owned(),
+    }
+}
+
+pub(crate) fn usage(message: impl Into<String>) -> GfileError {
+    GfileError::Usage {
+        message: message.into(),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum GfileError {

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::AppConfig,
-    error::{GfileError, IoOp},
+    error::{GfileError, IoOp, io_error},
     timeutil,
 };
 
@@ -179,14 +179,6 @@ pub fn clear(path: &Path) -> Result<(), GfileError> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error(source, path, IoOp::Write)),
-    }
-}
-
-fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
-    GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op,
     }
 }
 

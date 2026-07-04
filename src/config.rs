@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     download,
-    error::{GfileError, IoOp},
+    error::{GfileError, IoOp, io_error},
     upload,
 };
 
@@ -623,14 +623,6 @@ fn line_number(text: &str, offset: usize) -> usize {
         .filter(|byte| *byte == b'\n')
         .count()
         + 1
-}
-
-fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
-    GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op,
-    }
 }
 
 #[cfg(test)]

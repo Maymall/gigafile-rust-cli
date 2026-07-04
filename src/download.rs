@@ -21,7 +21,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    error::{BoxError, GfileError, IoOp},
+    error::{GfileError, IoOp, boxed, internal_error, io_error, network_error},
     http,
     jsonout::{self, ErrorJson},
     naming::{log_name_diagnostics, sanitize_server_filename},
@@ -1737,14 +1737,13 @@ fn segment_at(
     segments: &Arc<Mutex<Vec<SegmentState>>>,
     index: usize,
 ) -> Result<SegmentState, GfileError> {
-    let guard = segments.lock().map_err(|_| GfileError::Parse {
-        what: "segmented download state lock was poisoned".to_owned(),
-        hint: "This is an internal state error; please report it.".to_owned(),
-    })?;
-    guard.get(index).cloned().ok_or_else(|| GfileError::Parse {
-        what: format!("missing segment state at index {index}"),
-        hint: "This is an internal state error; please report it.".to_owned(),
-    })
+    let guard = segments
+        .lock()
+        .map_err(|_| internal_error("segmented download state lock was poisoned".to_owned()))?;
+    guard
+        .get(index)
+        .cloned()
+        .ok_or_else(|| internal_error(format!("missing segment state at index {index}")))
 }
 
 fn segment_snapshot(
@@ -1753,10 +1752,7 @@ fn segment_snapshot(
     segments
         .lock()
         .map(|segments| segments.clone())
-        .map_err(|_| GfileError::Parse {
-            what: "segmented download state lock was poisoned".to_owned(),
-            hint: "This is an internal state error; please report it.".to_owned(),
-        })
+        .map_err(|_| internal_error("segmented download state lock was poisoned".to_owned()))
 }
 
 fn update_segment_sidecar_sync(
@@ -1768,15 +1764,11 @@ fn update_segment_sidecar_sync(
     let mut segments = context
         .shared_segments
         .lock()
-        .map_err(|_| GfileError::Parse {
-            what: "segmented download state lock was poisoned".to_owned(),
-            hint: "This is an internal state error; please report it.".to_owned(),
-        })?;
+        .map_err(|_| internal_error("segmented download state lock was poisoned".to_owned()))?;
     let Some(segment) = segments.get_mut(index) else {
-        return Err(GfileError::Parse {
-            what: format!("missing segment state at index {index}"),
-            hint: "This is an internal state error; please report it.".to_owned(),
-        });
+        return Err(internal_error(format!(
+            "missing segment state at index {index}"
+        )));
     };
     segment.downloaded = downloaded;
     segment.done = done;
@@ -1835,9 +1827,8 @@ fn segment_sidecar_bytes(
         key_used,
         segments: segments.to_vec(),
     };
-    serde_json::to_vec(&sidecar).map_err(|source| GfileError::Parse {
-        what: format!("failed to serialize segmented sidecar: {source}"),
-        hint: "This is an internal state error; please report it.".to_owned(),
+    serde_json::to_vec(&sidecar).map_err(|source| {
+        internal_error(format!("failed to serialize segmented sidecar: {source}"))
     })
 }
 
@@ -2017,10 +2008,8 @@ async fn write_sidecar(
         expected,
         key_used,
     };
-    let sidecar_bytes = serde_json::to_vec(&sidecar).map_err(|source| GfileError::Parse {
-        what: format!("failed to serialize sidecar: {source}"),
-        hint: "This is an internal state error; please report it.".to_owned(),
-    })?;
+    let sidecar_bytes = serde_json::to_vec(&sidecar)
+        .map_err(|source| internal_error(format!("failed to serialize sidecar: {source}")))?;
     fs::write(sidecar_path, sidecar_bytes)
         .await
         .map_err(|source| io_error(source, sidecar_path, IoOp::Write))
@@ -2421,30 +2410,11 @@ async fn flush_before_return(writer: &mut BufWriter<File>) {
     let _ = writer.flush().await;
 }
 
-fn network_error(source: reqwest::Error, context: &str) -> GfileError {
-    GfileError::Network {
-        source: boxed(source),
-        context: context.to_owned(),
-    }
-}
-
 fn timeout_network_error(context: &str) -> GfileError {
     GfileError::Network {
         source: boxed(io::Error::new(io::ErrorKind::TimedOut, "stream timed out")),
         context: context.to_owned(),
     }
-}
-
-fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
-    GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op,
-    }
-}
-
-fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> BoxError {
-    Box::new(error)
 }
 
 #[cfg(test)]

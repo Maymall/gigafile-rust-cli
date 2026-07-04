@@ -7,6 +7,10 @@ Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidate duplicated error-construction helpers (`io_error`, `network_error`, `boxed`, `usage`, internal-state errors) into `error.rs`.
+
 ## [0.10.1] - 2026-07-04
 
 ### Fixed

@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    error::{BoxError, GfileError, IoOp},
+    error::{GfileError, IoOp, boxed, io_error, network_error, usage},
     http,
     parser::{
         download::{PageKind, parse_download_page},
@@ -246,7 +246,7 @@ pub fn validate_threads(threads: u8) -> Result<u8, GfileError> {
     if (MIN_UPLOAD_THREADS..=MAX_UPLOAD_THREADS).contains(&threads) {
         Ok(threads)
     } else {
-        Err(usage(&format!(
+        Err(usage(format!(
             "upload threads must be between {MIN_UPLOAD_THREADS} and {MAX_UPLOAD_THREADS}, got {threads}"
         )))
     }
@@ -1039,36 +1039,11 @@ fn estimate_expires_at(now: SystemTime, lifetime_days: u16) -> Option<String> {
     Some(timeutil::format_unix_utc(seconds))
 }
 
-fn usage(message: &str) -> GfileError {
-    GfileError::Usage {
-        message: message.to_owned(),
-    }
-}
-
-fn network_error(source: reqwest::Error, context: &str) -> GfileError {
-    GfileError::Network {
-        source: boxed(source),
-        context: context.to_owned(),
-    }
-}
-
 fn timeout_network_error(context: &str) -> GfileError {
     GfileError::Network {
         source: boxed(io::Error::new(io::ErrorKind::TimedOut, "request timed out")),
         context: context.to_owned(),
     }
-}
-
-fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
-    GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op,
-    }
-}
-
-fn boxed(error: impl std::error::Error + Send + Sync + 'static) -> BoxError {
-    Box::new(error)
 }
 
 #[cfg(test)]

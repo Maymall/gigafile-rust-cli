@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     download,
-    error::{GfileError, IoOp},
+    error::{GfileError, IoOp, io_error},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,14 +342,6 @@ fn system_time_unix(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
-}
-
-fn io_error(source: io::Error, path: &Path, op: IoOp) -> GfileError {
-    GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op,
-    }
 }
 
 #[cfg(test)]
