@@ -5,22 +5,43 @@
 [![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
 
 `rgfile` is a fast, robust command-line client for [GigaFile.nu](https://gigafile.nu):
-upload and download files straight from the terminal.
+upload, download, inspect, and delete shares straight from the terminal. It
+began as a Rust rewrite of the Python `gfile` tools and has grown into a
+full-featured client in its own right — resumable segmented downloads, share
+management, and protocol behavior verified against the live service.
 
 ## Features
 
-- Downloads single-file and multi-file (matomete) pages, with `--key` for password-protected links
-- Select files from matomete pages with `rgfile info` indexes and `download --select 1,3-5`
-- Resumable downloads: interrupted transfers continue from where they stopped, completion is atomic and size-verified
-- Correct filenames: decoded from `Content-Disposition` (RFC 5987), so UTF-8 / Japanese names survive intact
-- Streaming uploads with per-chunk retry; optional upload read-ahead keeps chunk completion ordered
-- Upload results include the download URL, delete key, and estimated expiry; lifetime selectable (3–100 days)
+**Downloads**
+
+- Single-file and multi-file (matomete) pages; `--key` for password-protected
+  links, `--select 1,3-5` to pick files by `rgfile info` index
+- Resumable: interrupted transfers continue where they stopped — including when
+  the page masks the display name; completion is atomic and size-verified
+- Segmented multi-connection mode (`--threads 1-16`) with one overall progress
+  bar plus per-connection child bars, each with its own speed
+- Ctrl-C prints how much reached disk and where the kept `.part` lives;
+  `rgfile parts list` / `parts clean` inspect and remove leftovers safely
+  (an active download's files are never touched)
+- Correct filenames decoded from `Content-Disposition` (RFC 5987): UTF-8 /
+  Japanese names survive intact even when the page shows a masked name
+
+**Uploads & share management**
+
+- Streaming chunked uploads with per-chunk retry and near-constant memory;
+  optional read-ahead window (`--threads`) keeps chunk completion ordered
+- Results include the download URL, delete key, and estimated expiry;
+  lifetime selectable (3–100 days)
+- `rgfile delete <url>` removes an uploaded share with its delete key
+
+**Workflow**
+
 - `rgfile info <url>` inspects a page without downloading
-- Optional TOML config and opt-in local history (`rgfile history list`)
-- `--json` output and stable exit codes for scripting
-- `rgfile self-update` upgrades release-installed binaries with SHA-256 verification
-- Shell completions via `rgfile completions <shell>`
-- Static musl Linux binary, plus macOS (arm64/Intel) and Windows builds
+- `dl` / `ul` aliases, shell completions, `--json` output and stable exit
+  codes for scripting
+- Interactive `rgfile config init` wizard, TOML config, opt-in local history
+- `rgfile self-update` with SHA-256 verification; static musl Linux binary,
+  plus macOS (arm64/Intel) and Windows builds
 
 ## Install
 
