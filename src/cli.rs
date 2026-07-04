@@ -13,10 +13,10 @@ use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    config, download,
+    config, delete, download,
     error::{GfileError, IoOp},
     history::{self, HistoryOverride, HistoryRecord},
-    info, jsonout, self_update, upload,
+    info, jsonout, parts, self_update, upload,
 };
 
 #[derive(Debug, Parser)]
@@ -207,6 +207,40 @@ pub enum Commands {
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
     },
+    /// Delete an uploaded file using its delete key.
+    Delete {
+        /// Download page URL to delete.
+        url: String,
+
+        /// Upload delete key.
+        #[arg(long = "delkey", value_name = "KEY")]
+        delkey: Option<String>,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long = "yes")]
+        yes: bool,
+
+        /// Per-request timeout in seconds.
+        #[arg(long = "timeout")]
+        timeout: Option<u64>,
+
+        /// Retry count for retryable network/server failures.
+        #[arg(long = "retries")]
+        retries: Option<u32>,
+
+        /// Override the default User-Agent.
+        #[arg(long = "user-agent")]
+        user_agent: Option<String>,
+
+        /// Print one JSON object.
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// List or clean leftover partial downloads.
+    Parts {
+        #[command(subcommand)]
+        command: PartsCommands,
+    },
     /// Inspect or clear local history.
     History {
         #[command(subcommand)]
@@ -240,6 +274,32 @@ pub enum HistoryCommands {
     },
     /// Clear the history file.
     Clear,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PartsCommands {
+    /// List partial download groups.
+    List {
+        /// Directory to scan (defaults to download.dir or current directory).
+        dir: Option<PathBuf>,
+
+        /// Print one JSON object.
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Clean partial download groups.
+    Clean {
+        /// Directory to scan (defaults to download.dir or current directory).
+        dir: Option<PathBuf>,
+
+        /// Only clean groups older than this many days.
+        #[arg(long = "older-than", value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Skip the interactive confirmation prompt.
+        #[arg(long = "yes")]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -485,6 +545,134 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         }
                     }
                 }
+                Commands::Delete {
+                    url,
+                    delkey,
+                    yes,
+                    timeout,
+                    retries,
+                    user_agent,
+                    json,
+                } => {
+                    let history_match = find_delete_key_in_history(&history_settings, &url)?;
+                    let history_files = history_match
+                        .as_ref()
+                        .map(|record| record.files.clone())
+                        .unwrap_or_default();
+                    let resolved_delkey = match delkey
+                        .or_else(|| history_match.and_then(|record| record.delete_key))
+                    {
+                        Some(delkey) => delkey,
+                        None => {
+                            let error = GfileError::Usage {
+                                message: "delete key required; pass --delkey KEY, or enable history.store_delete_keys before uploading so rgfile can find it later".to_owned(),
+                            };
+                            if json {
+                                let code = error.exit_code();
+                                jsonout::print_error(&error)?;
+                                return Ok(RunOutcome::Failure(code));
+                            }
+                            return Err(error);
+                        }
+                    };
+
+                    if !yes {
+                        confirm_delete_interactive(
+                            &url,
+                            history_files.first().map(String::as_str),
+                        )?;
+                    }
+
+                    let result = delete::delete(delete::DeleteOptions {
+                        url: url.clone(),
+                        delkey: resolved_delkey,
+                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
+                        retries: config.resolve_retries(retries),
+                        user_agent: config.resolve_user_agent(user_agent),
+                        allow_any_host: test_allow_any_host(),
+                    })
+                    .await;
+
+                    match result {
+                        Ok(report) => {
+                            if json {
+                                jsonout::print_json(&DeleteReportJson {
+                                    status: "ok",
+                                    url: &report.url,
+                                })?;
+                            } else {
+                                println!("deleted {}", report.url);
+                            }
+                            record_delete_history(
+                                &history_settings,
+                                url,
+                                history_files,
+                                "ok".to_owned(),
+                            );
+                            Ok(RunOutcome::Success)
+                        }
+                        Err(error) if json => {
+                            let code = error.exit_code();
+                            jsonout::print_error(&error)?;
+                            record_delete_history(
+                                &history_settings,
+                                url,
+                                history_files,
+                                code.to_string(),
+                            );
+                            Ok(RunOutcome::Failure(code))
+                        }
+                        Err(error) => {
+                            let code = error.exit_code();
+                            record_delete_history(
+                                &history_settings,
+                                url,
+                                history_files,
+                                code.to_string(),
+                            );
+                            Err(error)
+                        }
+                    }
+                }
+                Commands::Parts { command } => match command {
+                    PartsCommands::List { dir, json } => {
+                        let dir = resolve_parts_dir(&config, dir)?;
+                        let report = parts::list(dir)?;
+                        if json {
+                            jsonout::print_json(&report)?;
+                        } else {
+                            print_human_parts_list(&report);
+                        }
+                        Ok(RunOutcome::Success)
+                    }
+                    PartsCommands::Clean {
+                        dir,
+                        older_than,
+                        yes,
+                    } => {
+                        let dir = resolve_parts_dir(&config, dir)?;
+                        let report = parts::list(dir.clone())?;
+                        let older_than = older_than.map(days_duration).transpose()?;
+                        let candidates = parts::clean_candidates(&report.groups, older_than);
+                        let active_count =
+                            report.groups.iter().filter(|group| group.active).count();
+                        if candidates.is_empty() {
+                            println!("nothing to clean");
+                            if active_count > 0 {
+                                eprintln!(
+                                    "Skipped {active_count} active partial download group(s)."
+                                );
+                            }
+                            return Ok(RunOutcome::Success);
+                        }
+                        if !yes {
+                            confirm_parts_clean_interactive(&candidates)?;
+                        }
+                        let clean_report = parts::clean(dir, &report.groups, older_than)?;
+                        print_human_parts_clean(&clean_report);
+                        Ok(RunOutcome::Success)
+                    }
+                },
                 Commands::History { command } => match command {
                     HistoryCommands::List { json, limit } => {
                         let records =
@@ -546,6 +734,12 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
 struct HistoryListJson<'a> {
     status: &'static str,
     entries: &'a [HistoryRecord],
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteReportJson<'a> {
+    status: &'static str,
+    url: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -877,6 +1071,30 @@ fn resolve_download_output(
     Ok(Some(path))
 }
 
+fn resolve_parts_dir(
+    config: &config::AppConfig,
+    cli_dir: Option<PathBuf>,
+) -> Result<PathBuf, GfileError> {
+    if let Some(dir) = cli_dir {
+        return Ok(dir);
+    }
+    if let Some(dir) = &config.download.dir {
+        return Ok(dir.clone());
+    }
+    std::env::current_dir().map_err(|source| GfileError::Io {
+        source,
+        path: PathBuf::from("."),
+        op: IoOp::Metadata,
+    })
+}
+
+fn days_duration(days: u64) -> Result<Duration, GfileError> {
+    let seconds = days.checked_mul(86_400).ok_or_else(|| GfileError::Usage {
+        message: "--older-than is too large".to_owned(),
+    })?;
+    Ok(Duration::from_secs(seconds))
+}
+
 fn record_download_history(
     settings: &history::HistorySettings,
     page_url: String,
@@ -940,6 +1158,87 @@ fn record_upload_error_history(
         None,
     );
     history::append(settings, &record);
+}
+
+fn find_delete_key_in_history(
+    settings: &history::HistorySettings,
+    url: &str,
+) -> Result<Option<HistoryRecord>, GfileError> {
+    if !settings.enabled || !settings.store_delete_keys {
+        return Ok(None);
+    }
+    let records = history::read(&settings.path)?;
+    Ok(records.into_iter().rev().find(|record| {
+        record.operation == history::HistoryOperation::Upload
+            && record.page_url == url
+            && record.delete_key.is_some()
+    }))
+}
+
+fn record_delete_history(
+    settings: &history::HistorySettings,
+    page_url: String,
+    files: Vec<String>,
+    result: String,
+) {
+    let record = HistoryRecord::delete(page_url, files, result);
+    history::append(settings, &record);
+}
+
+fn confirm_delete_interactive(url: &str, filename: Option<&str>) -> Result<(), GfileError> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(GfileError::Usage {
+            message: "delete is destructive; pass --yes in non-interactive runs".to_owned(),
+        });
+    }
+    eprintln!("Delete shared file:");
+    if let Some(filename) = filename {
+        eprintln!("  file: {filename}");
+    }
+    eprintln!("  url: {url}");
+    eprint!("Proceed? [y/N]: ");
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|source| GfileError::Io {
+            source,
+            path: PathBuf::from("<stdin>"),
+            op: IoOp::Read,
+        })?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err(GfileError::Usage {
+            message: "delete aborted; file was not deleted".to_owned(),
+        }),
+    }
+}
+
+fn confirm_parts_clean_interactive(candidates: &[parts::PartGroup]) -> Result<(), GfileError> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(GfileError::Usage {
+            message: "parts clean is destructive; pass --yes in non-interactive runs".to_owned(),
+        });
+    }
+    eprintln!("Partial download groups to delete:");
+    for group in candidates {
+        eprintln!("  {}", group.target_name);
+    }
+    eprint!("Proceed? [y/N]: ");
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|source| GfileError::Io {
+            source,
+            path: PathBuf::from("<stdin>"),
+            op: IoOp::Read,
+        })?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err(GfileError::Usage {
+            message: "parts clean aborted; no files were deleted".to_owned(),
+        }),
+    }
 }
 
 fn total_download_bytes(report: &download::DownloadReport) -> Option<u64> {
@@ -1017,12 +1316,80 @@ fn print_human_upload_report(report: &upload::UploadReport) {
     }
 }
 
+fn print_human_parts_list(report: &parts::PartsReport) {
+    println!("dir\t{}", report.dir.display());
+    println!(
+        "target\tstate\tactive\tdisk_bytes\tcompleted_bytes\texpected_bytes\tprogress\tmtime_unix"
+    );
+    for group in &report.groups {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            group.target_name,
+            part_state_name(group.state),
+            group.active,
+            group.disk_bytes,
+            optional_u64(group.completed_bytes),
+            optional_u64(group.expected_bytes),
+            optional_percent(group.progress_percent),
+            optional_u64(group.mtime_unix)
+        );
+    }
+}
+
+fn print_human_parts_clean(report: &parts::CleanReport) {
+    for group in &report.deleted {
+        println!("deleted\t{}", group.target_name);
+        for path in &group.paths {
+            println!("removed\t{}", path.display());
+        }
+    }
+    for group in &report.skipped_active {
+        eprintln!("skipped active\t{}", group.target_name);
+    }
+    for failure in &report.failed {
+        eprintln!(
+            "failed\t{}\t{}\t{}",
+            failure.target_name,
+            failure.path.display(),
+            failure.message
+        );
+    }
+    println!(
+        "summary\tdeleted={}\tskipped_active={}\tfailed={}",
+        report.deleted.len(),
+        report.skipped_active.len(),
+        report.failed.len()
+    );
+}
+
+fn part_state_name(state: parts::PartState) -> &'static str {
+    match state {
+        parts::PartState::Resumable => "resumable",
+        parts::PartState::PartWithoutSidecar => "part_without_sidecar",
+        parts::PartState::SidecarWithoutPart => "sidecar_without_part",
+        parts::PartState::LockOnly => "lock_only",
+    }
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn optional_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn print_human_history(records: &[HistoryRecord]) {
     println!("timestamp\toperation\tresult\tbytes\tfiles\turl");
     for record in records {
         let operation = match record.operation {
             history::HistoryOperation::Download => "download",
             history::HistoryOperation::Upload => "upload",
+            history::HistoryOperation::Delete => "delete",
         };
         let bytes = record
             .bytes

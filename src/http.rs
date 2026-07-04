@@ -132,9 +132,14 @@ pub fn retry_delay(attempt: u32) -> Duration {
 }
 
 pub fn redact_url(input: &str) -> String {
-    let re = Regex::new(r"(?i)(^|[?&])dlkey=[^&#]*").expect("valid dlkey redaction regex");
+    let re = Regex::new(r"(?i)(^|[?&])(dlkey|delkey|delete_key)=[^&#]*")
+        .expect("valid key redaction regex");
     re.replace_all(input, |caps: &regex::Captures<'_>| {
-        format!("{}dlkey=***", caps.get(1).map_or("", |m| m.as_str()))
+        format!(
+            "{}{}=***",
+            caps.get(1).map_or("", |m| m.as_str()),
+            caps.get(2).map_or("", |m| m.as_str())
+        )
     })
     .into_owned()
 }
@@ -174,6 +179,10 @@ mod tests {
         assert_eq!(
             redact_url("https://23.gigafile.nu/download.php?file=X"),
             "https://23.gigafile.nu/download.php?file=X"
+        );
+        assert_eq!(
+            redact_url("https://23.gigafile.nu/remove.php?file=X&delkey=EXAMPLE-DELKEY-0000"),
+            "https://23.gigafile.nu/remove.php?file=X&delkey=***"
         );
     }
 }

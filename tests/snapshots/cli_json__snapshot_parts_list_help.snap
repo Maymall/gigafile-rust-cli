@@ -1,0 +1,21 @@
+---
+source: tests/cli_json.rs
+expression: normalize_help(&output.stdout)
+---
+List partial download groups
+
+Usage: rgfile parts list [OPTIONS] [DIR]
+
+Arguments:
+  [DIR]  Directory to scan (defaults to download.dir or current directory)
+
+Options:
+      --json  Print one JSON object
+  -h, --help  Print help
+
+Global Options:
+  -v, --verbose...     Increase logging verbosity (-v for info, -vv for debug)
+      --config <PATH>  Load configuration from a specific TOML file
+      --no-config      Do not load a configuration file
+      --history        Enable history for this run
+      --no-history     Disable history for this run

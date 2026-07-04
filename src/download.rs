@@ -2042,7 +2042,7 @@ fn lock_path_for_sidecar(sidecar_path: &Path) -> Result<PathBuf, GfileError> {
     Ok(lock_path)
 }
 
-fn is_lock_contention(source: &io::Error) -> bool {
+pub(crate) fn is_lock_contention(source: &io::Error) -> bool {
     source.kind() == io::ErrorKind::WouldBlock
         || matches!(
             source.raw_os_error(),

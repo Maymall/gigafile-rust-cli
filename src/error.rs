@@ -55,6 +55,9 @@ pub enum GfileError {
     #[error("download target is locked at {}", path.display())]
     TargetLocked { path: PathBuf },
 
+    #[error("delete rejected")]
+    DeleteRejected { detail: String, status: Option<i64> },
+
     #[error("upload rejected")]
     UploadRejected {
         detail: String,
@@ -108,6 +111,7 @@ impl GfileError {
             Self::VerifyFailed { .. } => 20,
             Self::ChecksumMismatch { .. } => 20,
             Self::TargetLocked { .. } => 21,
+            Self::DeleteRejected { .. } => 22,
         }
     }
 
@@ -124,6 +128,7 @@ impl GfileError {
             Self::SizeMismatch { .. } => "size_mismatch",
             Self::Io { .. } => "io",
             Self::TargetLocked { .. } => "target_locked",
+            Self::DeleteRejected { .. } => "delete_rejected",
             Self::UploadRejected { .. } => "upload_rejected",
             Self::VerifyFailed { .. } => "verify_failed",
             Self::ChecksumMismatch { .. } => "verify_failed",
@@ -173,6 +178,15 @@ impl GfileError {
                 "Another rgfile process appears to be downloading this file. Wait for it to finish, or remove the lock file if that process crashed: {}",
                 path.display()
             ),
+            Self::DeleteRejected { detail, status } => {
+                let status = status
+                    .map(|status| format!(" (delete status {status})"))
+                    .unwrap_or_default();
+                format!(
+                    "The delete request was rejected{status}: {}. Check the delete key and the URL, then try again.",
+                    sanitize_message(detail)
+                )
+            }
             Self::UploadRejected { detail, .. } => format!(
                 "The upload was rejected: {}. Retry later; if it keeps failing, rerun with -vv and report the response details.",
                 sanitize_message(detail)
@@ -316,6 +330,20 @@ mod tests {
         assert!(message.contains("redacted-delete-key"), "{message}");
     }
 
+    #[test]
+    fn user_message_redacts_delete_rejected_detail() {
+        let error = GfileError::DeleteRejected {
+            detail: "delkey=EXAMPLE-DELKEY-0000".to_owned(),
+            status: Some(1),
+        };
+
+        let message = error.user_message();
+
+        assert!(message.contains("delete status 1"), "{message}");
+        assert!(!message.contains("EXAMPLE-DELKEY-0000"), "{message}");
+        assert!(message.contains("redacted-delete-key"), "{message}");
+    }
+
     fn error_cases() -> Vec<(GfileError, u8)> {
         vec![
             (
@@ -377,6 +405,13 @@ mod tests {
                     path: PathBuf::from("example file.bin.part.json.lock"),
                 },
                 21,
+            ),
+            (
+                GfileError::DeleteRejected {
+                    detail: "delete status 1".to_owned(),
+                    status: Some(1),
+                },
+                22,
             ),
             (
                 GfileError::UploadRejected {

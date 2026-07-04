@@ -7,6 +7,13 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-04
+
+### Added
+
+- Add `rgfile delete` for removing an uploaded file with its delete key, including optional history lookup for stored delete keys.
+- Add `rgfile parts list` and `rgfile parts clean` to inspect and safely remove leftover `.part` files, sidecars, and stale locks.
+
 ## [0.8.1] - 2026-07-04
 
 ### Changed

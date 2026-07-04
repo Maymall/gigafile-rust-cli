@@ -1,0 +1,26 @@
+---
+source: tests/cli_json.rs
+expression: stdout
+---
+Delete an uploaded file using its delete key
+
+Usage: rgfile delete [OPTIONS] <URL>
+
+Arguments:
+  <URL>  Download page URL to delete
+
+Options:
+      --delkey <KEY>             Upload delete key
+      --yes                      Skip the interactive confirmation prompt
+      --timeout <TIMEOUT>        Per-request timeout in seconds
+      --retries <RETRIES>        Retry count for retryable network/server failures
+      --user-agent <USER_AGENT>  Override the default User-Agent
+      --json                     Print one JSON object
+  -h, --help                     Print help
+
+Global Options:
+  -v, --verbose...     Increase logging verbosity (-v for info, -vv for debug)
+      --config <PATH>  Load configuration from a specific TOML file
+      --no-config      Do not load a configuration file
+      --history        Enable history for this run
+      --no-history     Disable history for this run

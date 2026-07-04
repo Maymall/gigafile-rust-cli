@@ -45,6 +45,7 @@ pub struct HistoryRecord {
 pub enum HistoryOperation {
     Download,
     Upload,
+    Delete,
 }
 
 impl HistoryRecord {
@@ -82,6 +83,19 @@ impl HistoryRecord {
             bytes,
             result,
             delete_key,
+        }
+    }
+
+    pub fn delete(page_url: String, files: Vec<String>, result: String) -> Self {
+        Self {
+            timestamp: timeutil::now_utc_timestamp()
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned()),
+            operation: HistoryOperation::Delete,
+            page_url,
+            files,
+            bytes: None,
+            result,
+            delete_key: None,
         }
     }
 }

@@ -70,6 +70,56 @@ fn snapshot_info_help() {
 }
 
 #[test]
+fn snapshot_delete_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "delete", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = normalize_help(&output.stdout);
+    assert!(!stdout.contains("GFILE_TEST_ALLOW_ANY_HOST"));
+    insta::assert_snapshot!(stdout);
+}
+
+#[test]
+fn snapshot_parts_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "parts", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
+}
+
+#[test]
+fn snapshot_parts_list_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "parts", "list", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
+}
+
+#[test]
+fn snapshot_parts_clean_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "parts", "clean", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
+}
+
+#[test]
 fn snapshot_config_help() {
     let output = Command::cargo_bin("rgfile")
         .unwrap()

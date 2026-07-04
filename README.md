@@ -76,8 +76,16 @@ rgfile upload ./example-file.bin --lifetime 7
 rgfile upload ./example-file.bin --threads 4
 rgfile upload --json ./example-file.bin
 
+# Delete an uploaded file by URL and delete key
+rgfile delete https://23.gigafile.nu/0123abcd-000000example --delkey EXA1
+rgfile delete https://23.gigafile.nu/0123abcd-000000example --yes
+
 # Inspect a page without downloading
 rgfile info https://23.gigafile.nu/0123abcd-000000example
+
+# Inspect or clean leftover partial downloads
+rgfile parts list ./downloads
+rgfile parts clean ./downloads --older-than 7 --yes
 
 # Generate shell completions
 rgfile completions zsh > _rgfile
@@ -130,7 +138,9 @@ rgfile history clear
 ```
 
 Download passwords are never stored. Upload delete keys are stored only if you
-opt in with `history.store_delete_keys = true`.
+opt in with `history.store_delete_keys = true`. `rgfile delete` can use a stored
+delete key when history is enabled and the URL matches a previous upload record;
+otherwise pass `--delkey`.
 
 ## Exit codes
 
@@ -150,6 +160,7 @@ opt in with `history.store_delete_keys = true`.
 | 19 | Upload rejected by the server |
 | 20 | Upload or self-update verification failed |
 | 21 | Download target is already locked by another rgfile process |
+| 22 | Delete request rejected by the server |
 | 130 | Interrupted with Ctrl-C; a summary shows the kept `.part` for resume |
 
 ## Notes
@@ -165,6 +176,8 @@ opt in with `history.store_delete_keys = true`.
   `threads = 1` keeps the streaming one-chunk behavior; higher values can use
   roughly `N * chunk-size` memory plus HTTP overhead.
 - Uploads cannot resume across runs; a failed upload restarts from scratch.
+- `parts clean` never removes a group whose `.part.json.lock` is currently held
+  by another rgfile process.
 - rgfile does not bypass GigaFile restrictions, guess passwords, or scrape links.
 
 ## License

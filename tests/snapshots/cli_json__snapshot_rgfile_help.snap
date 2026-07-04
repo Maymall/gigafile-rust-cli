@@ -10,6 +10,8 @@ Commands:
   download     Download a file from a public GigaFile page [aliases: dl]
   info         Show metadata for a public GigaFile page without downloading files
   upload       Upload a local file [aliases: ul]
+  delete       Delete an uploaded file using its delete key
+  parts        List or clean leftover partial downloads
   history      Inspect or clear local history
   config       Inspect or create the rgfile configuration file
   self-update  Update this rgfile binary from the latest GitHub Release
