@@ -46,7 +46,12 @@ pub fn spawn_ctrl_c_reporter() {
                         "{}",
                         format_interrupt_summary(downloaded, active.expected, &active.part_path)
                     ),
-                    None => eprintln!("Interrupted."),
+                    // Progress could not be read back reliably; say so rather
+                    // than guessing, but still point at the kept .part.
+                    None => eprintln!(
+                        "Interrupted.\nPartial download kept: {}\nRe-run the same command to resume.",
+                        active.part_path.display()
+                    ),
                 }
             }
             None => eprintln!("Interrupted."),

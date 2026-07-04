@@ -1679,8 +1679,23 @@ fn update_segment_sidecar_sync(
         context.key_used,
         &segments,
     )?;
-    std::fs::write(&context.sidecar_path, bytes)
+    // Atomic replace: this file is rewritten after every chunk while other
+    // code (the interrupt summary, a resume check) may read it at any moment;
+    // a plain truncate-and-write leaves it unparsable for most of its life.
+    // Writers are serialized by the shared_segments lock held above.
+    let tmp_path = sidecar_tmp_path(&context.sidecar_path);
+    std::fs::write(&tmp_path, bytes).map_err(|source| io_error(source, &tmp_path, IoOp::Write))?;
+    std::fs::rename(&tmp_path, &context.sidecar_path)
         .map_err(|source| io_error(source, &context.sidecar_path, IoOp::Write))
+}
+
+fn sidecar_tmp_path(sidecar_path: &Path) -> PathBuf {
+    let mut name = sidecar_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    sidecar_path.with_file_name(name)
 }
 
 async fn write_segment_sidecar(
@@ -1691,7 +1706,11 @@ async fn write_segment_sidecar(
     segments: &[SegmentState],
 ) -> Result<(), GfileError> {
     let sidecar_bytes = segment_sidecar_bytes(file_id, expected, key_used, segments)?;
-    fs::write(sidecar_path, sidecar_bytes)
+    let tmp_path = sidecar_tmp_path(sidecar_path);
+    fs::write(&tmp_path, sidecar_bytes)
+        .await
+        .map_err(|source| io_error(source, &tmp_path, IoOp::Write))?;
+    fs::rename(&tmp_path, sidecar_path)
         .await
         .map_err(|source| io_error(source, sidecar_path, IoOp::Write))
 }
@@ -1902,15 +1921,41 @@ async fn write_sidecar(
 
 /// How many bytes of a `.part` are actually usable for resume, read back from
 /// disk: the v2 sidecar's per-segment progress when present (the segmented
-/// `.part` is preallocated to full size, so its length says nothing), else the
-/// sequential `.part` length itself.
+/// `.part` is preallocated to full size, so its length says nothing), the
+/// `.part` length for the sequential v1 sidecar (append-only writes), and the
+/// `.part` length when no sidecar exists at all.
+///
+/// Returns `None` when a sidecar exists but cannot be understood — reporting
+/// the preallocated `.part` length in that case would claim 100% progress for
+/// a barely-started segmented download.
 pub(crate) fn bytes_completed_on_disk(part_path: &Path, sidecar_path: &Path) -> Option<u64> {
-    if let Ok(bytes) = std::fs::read(sidecar_path) {
-        if let Some(sidecar) = parse_segment_sidecar(&bytes) {
-            return Some(sidecar.segments.iter().map(segment_completed_bytes).sum());
+    for attempt in 0..3 {
+        match std::fs::read(sidecar_path) {
+            Ok(bytes) => {
+                if let Some(sidecar) = parse_segment_sidecar(&bytes) {
+                    return Some(sidecar.segments.iter().map(segment_completed_bytes).sum());
+                }
+                let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|value| value.get("version")?.as_u64());
+                if version == Some(1) {
+                    // Sequential downloads append, so the .part length is the progress.
+                    return std::fs::metadata(part_path).ok().map(|meta| meta.len());
+                }
+                if version.is_none() && attempt < 2 {
+                    // Possibly caught mid-write; give the writer a moment.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                return None;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return std::fs::metadata(part_path).ok().map(|meta| meta.len());
+            }
+            Err(_) => return None,
         }
     }
-    std::fs::metadata(part_path).ok().map(|meta| meta.len())
+    None
 }
 
 async fn promote_part(
@@ -2314,5 +2359,82 @@ mod tests {
     #[test]
     fn progress_label_falls_back_to_page_name_without_file_name() {
         assert_eq!(progress_label(Path::new("/"), "******.mmts"), "******.mmts");
+    }
+
+    #[test]
+    fn bytes_completed_on_disk_sums_v2_sidecar_not_preallocated_length() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        // Preallocated to full size, like a segmented download.
+        std::fs::write(&part_path, vec![0_u8; 1000]).unwrap();
+        std::fs::write(
+            &sidecar_path,
+            serde_json::json!({
+                "version": 2,
+                "file_id": "0123abcd-000000example",
+                "expected": 1000,
+                "key_used": false,
+                "segments": [
+                    {"start": 0, "end": 499, "done": true, "downloaded": 500},
+                    {"start": 500, "end": 999, "done": false, "downloaded": 120},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes_completed_on_disk(&part_path, &sidecar_path),
+            Some(620)
+        );
+    }
+
+    #[test]
+    fn bytes_completed_on_disk_uses_part_length_for_v1_sidecar() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        std::fs::write(&part_path, vec![0_u8; 321]).unwrap();
+        std::fs::write(
+            &sidecar_path,
+            serde_json::json!({
+                "version": 1,
+                "file_id": "0123abcd-000000example",
+                "expected": 1000,
+                "key_used": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bytes_completed_on_disk(&part_path, &sidecar_path),
+            Some(321)
+        );
+    }
+
+    #[test]
+    fn bytes_completed_on_disk_refuses_to_guess_from_corrupt_sidecar() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        // Preallocated .part: guessing from its length would claim 100%.
+        std::fs::write(&part_path, vec![0_u8; 1000]).unwrap();
+        std::fs::write(&sidecar_path, b"{\"version\": 2, \"trunc").unwrap();
+
+        assert_eq!(bytes_completed_on_disk(&part_path, &sidecar_path), None);
+    }
+
+    #[test]
+    fn bytes_completed_on_disk_uses_part_length_without_sidecar() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        std::fs::write(&part_path, vec![0_u8; 55]).unwrap();
+
+        assert_eq!(
+            bytes_completed_on_disk(&part_path, &temp.path().join("file.bin.part.json")),
+            Some(55)
+        );
     }
 }

@@ -336,7 +336,7 @@ pub fn init_tracing(verbosity: u8) {
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(crate::progress::LogWriter)
         .try_init();
 }
 

@@ -7,6 +7,18 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-04
+
+### Fixed
+
+- Write download sidecars atomically. The Ctrl-C summary could read a half-written sidecar and fall back to the preallocated `.part` length, falsely reporting 100% for a partial segmented download; unreadable sidecars now report unknown progress instead of guessing.
+- Stop counting preset resume positions as instantaneous transfer, which showed absurd `TiB/s` speeds on resumed or already-completed segments.
+- Route log lines through the active progress display and clear dropped progress groups, so warnings and retries no longer leave stacked stale progress frames on screen.
+
+### Added
+
+- Show a percentage on the overall download and upload progress bars.
+
 ## [0.9.1] - 2026-07-04
 
 ### Fixed

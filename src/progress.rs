@@ -1,11 +1,68 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    io::IsTerminal,
+    io::{self, IsTerminal, Write},
     sync::{Arc, Mutex},
 };
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+/// The progress display currently owning the terminal draw area, if any. Log
+/// lines must be written through its `suspend` so they do not corrupt the
+/// in-place redraw (stray stderr writes make indicatif reprint the whole
+/// group below the old frame).
+static ACTIVE_DRAW: Mutex<Option<ActiveDraw>> = Mutex::new(None);
+
+#[derive(Clone)]
+enum ActiveDraw {
+    Single(ProgressBar),
+    Multi(MultiProgress),
+}
+
+fn set_active_draw(active: Option<ActiveDraw>) {
+    if let Ok(mut guard) = ACTIVE_DRAW.lock() {
+        *guard = active;
+    }
+}
+
+fn current_active_draw() -> Option<ActiveDraw> {
+    ACTIVE_DRAW.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// `tracing` writer that routes log lines through the active progress
+/// display's `suspend`, so warnings printed mid-transfer do not break the
+/// progress redraw.
+pub struct LogWriter;
+
+pub struct LogWriterHandle;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogWriterHandle;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriterHandle
+    }
+}
+
+impl Write for LogWriterHandle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let write_all = || {
+            let mut stderr = io::stderr();
+            let written = stderr.write(buf)?;
+            stderr.flush()?;
+            Ok(written)
+        };
+        match current_active_draw() {
+            Some(ActiveDraw::Multi(multi)) => multi.suspend(write_all),
+            Some(ActiveDraw::Single(bar)) => bar.suspend(write_all),
+            None => write_all(),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
 
 #[derive(Clone)]
 pub struct ByteProgress {
@@ -24,12 +81,13 @@ impl ByteProgress {
 
         let bar = ProgressBar::new(total);
         let style = ProgressStyle::with_template(
-            "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
+            "{msg} [{bar:40.cyan/blue}] {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=> ");
         bar.set_style(style);
         bar.set_message(label.to_owned());
+        set_active_draw(Some(ActiveDraw::Single(bar.clone())));
 
         Self { bar: Some(bar) }
     }
@@ -49,6 +107,7 @@ impl ByteProgress {
     pub fn finish(&self) {
         if let Some(bar) = &self.bar {
             bar.finish_and_clear();
+            set_active_draw(None);
         }
     }
 }
@@ -69,6 +128,20 @@ struct SegmentedProgressInner {
     positions: Mutex<SegmentPositions>,
     total: Option<u64>,
     segment_totals: Vec<u64>,
+}
+
+impl Drop for SegmentedProgressInner {
+    // Error paths drop the group without calling finish(); without this the
+    // last frame stays on screen and every retry stacks a new copy below it.
+    fn drop(&mut self) {
+        if let Some(bars) = &self.bars {
+            set_active_draw(None);
+            for bar in &bars.segments {
+                bar.finish_and_clear();
+            }
+            bars.main.finish_and_clear();
+        }
+    }
 }
 
 struct SegmentedBars {
@@ -213,6 +286,7 @@ impl SegmentedProgress {
 
     pub fn finish(&self) {
         if let Some(bars) = &self.inner.bars {
+            set_active_draw(None);
             for bar in &bars.segments {
                 bar.finish_and_clear();
             }
@@ -240,12 +314,16 @@ fn segmented_bars(
     segment_speed: bool,
 ) -> SegmentedBars {
     let multi = MultiProgress::new();
+    // Preset resume positions via with_position BEFORE the bar joins the draw
+    // group: set_position after add() draws one frame whose rate estimator
+    // counts the preset as an instantaneous transfer (absurd TiB/s speeds).
     let main = multi.add(
         ProgressBar::new(total)
             .with_style(main_style())
-            .with_message(label.to_owned()),
+            .with_message(label.to_owned())
+            .with_position(segment_positions.iter().sum::<u64>().min(total)),
     );
-    main.set_position(segment_positions.iter().sum::<u64>().min(total));
+    main.reset_eta();
     main.tick();
 
     let mut segments = Vec::with_capacity(segment_totals.len());
@@ -256,21 +334,26 @@ fn segmented_bars(
         } else {
             "  ├─"
         };
+        let initial = segment_positions
+            .get(index)
+            .copied()
+            .unwrap_or(0)
+            .min(total);
         let bar = multi.insert_after(
             &previous,
             ProgressBar::new(total)
                 .with_style(segment_style(segment_speed))
                 .with_prefix(prefix.to_owned())
-                .with_message(format!("{segment_label} {}", index + 1)),
+                .with_message(format!("{segment_label} {}", index + 1))
+                .with_position(initial),
         );
-        if let Some(position) = segment_positions.get(index).copied() {
-            bar.set_position(position.min(total));
-        }
+        bar.reset_eta();
         bar.tick();
         previous = bar.clone();
         segments.push(bar);
     }
 
+    set_active_draw(Some(ActiveDraw::Multi(multi.clone())));
     SegmentedBars {
         _multi: multi,
         main,
@@ -280,7 +363,7 @@ fn segmented_bars(
 
 fn main_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
+        "{msg} [{bar:40.cyan/blue}] {percent:>3}% {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=> ")
