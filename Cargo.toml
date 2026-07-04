@@ -1,9 +1,9 @@
 [package]
 name = "rgfile"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
-license = "GPL-3.0-only"
+license = "MIT"
 repository = "https://github.com/Maymall/gigafile-rust-cli"
 description = "A fast, robust CLI for GigaFile.nu: resumable segmented downloads, streaming uploads, and share management."
 readme = "README.md"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities"]
 
 [package.metadata.deb]
 maintainer = "Maymall <282547878+Maymall@users.noreply.github.com>"
-copyright = "2026, rgfile contributors. GPL-3.0-only."
+copyright = "2026, Maymall. MIT."
 license-file = ["LICENSE", "0"]
 extended-description = """\
 rgfile is a fast, robust command-line client for GigaFile.nu. It supports \
@@ -24,7 +24,6 @@ depends = ""
 assets = [
     ["target/release/rgfile", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/rgfile/README.md", "644"],
-    ["NOTICE.md", "usr/share/doc/rgfile/NOTICE.md", "644"],
 ]
 
 [lib]

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -280,6 +280,14 @@ impl SegmentedProgress {
             bars.main.set_position(main);
             if let Some(bar) = bars.segments.get(index) {
                 bar.set_position(position);
+            }
+        }
+    }
+
+    pub fn set_segment_message(&self, index: usize, message: String) {
+        if let Some(bars) = &self.inner.bars {
+            if let Some(bar) = bars.segments.get(index) {
+                bar.set_message(message);
             }
         }
     }

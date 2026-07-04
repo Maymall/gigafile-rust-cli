@@ -80,8 +80,7 @@ jobs:
           name="rgfile-${version}-${target}"
           mkdir -p "dist/${name}"
           cp "target/${target}/release/rgfile${{ matrix.exe }}" "dist/${name}/"
-          cp LICENSE README.md NOTICE.md "dist/${name}/"
-          cp NOTICE.md "dist/${name}/NOTICE"
+          cp LICENSE README.md "dist/${name}/"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             (cd dist && 7z a "${name}.zip" "${name}" >/dev/null)
           else
@@ -202,7 +201,7 @@ jobs:
             in_section {
               print
             }
-          ' CHANGELOG.md > changelog-excerpt.md
+          ' docs/CHANGELOG.md > changelog-excerpt.md
 
           {
             echo "## ${GITHUB_REF_NAME}"
@@ -213,14 +212,12 @@ jobs:
               echo "Release candidate for v${changelog_version}."
             fi
             echo
-            echo "### License and Corresponding Source"
+            echo "### License"
             echo
-            echo "This binary release is distributed under GPL-3.0-only."
-            echo "Each archive includes LICENSE, NOTICE, NOTICE.md, and README.md."
-            echo "Corresponding source is the repository content at:"
+            echo "This binary release is distributed under the MIT license."
+            echo "Each archive includes LICENSE and README.md."
+            echo "Source for this release is the repository content at:"
             echo "https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}"
-            echo
-            echo "See NOTICE.md for GPL attribution to the upstream Python gfile implementations."
           } > RELEASE_NOTES.md
 
       - name: Check existing GitHub Release

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 use std::{
     fs::OpenOptions,
@@ -247,6 +247,24 @@ fn cli_parts_clean_yes_skips_active_lock_and_deletes_stale() {
     assert!(!temp.path().join("stale.bin.part.json").exists());
 
     FileExt::unlock(&lock_file).unwrap();
+}
+
+#[test]
+fn cli_parts_clean_yes_deletes_sidecar_tmp() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("stale.bin.part"), b"stale").unwrap();
+    std::fs::write(temp.path().join("stale.bin.part.json.tmp"), b"tmp").unwrap();
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "parts", "clean", "--yes"])
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted\tstale.bin"));
+
+    assert!(!temp.path().join("stale.bin.part").exists());
+    assert!(!temp.path().join("stale.bin.part.json.tmp").exists());
 }
 
 #[test]

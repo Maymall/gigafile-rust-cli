@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Maymall/gigafile-rust-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Maymall/gigafile-rust-cli/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/rgfile.svg)](https://crates.io/crates/rgfile)
-[![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `rgfile` is a fast, robust command-line client for [GigaFile.nu](https://gigafile.nu):
 upload, download, inspect, and delete shares straight from the terminal, with
@@ -70,6 +70,8 @@ Debian / Ubuntu: download `rgfile_<version>_amd64.deb` from the
 [latest release](https://github.com/Maymall/gigafile-rust-cli/releases/latest)
 and `sudo apt install ./rgfile_<version>_amd64.deb`. Release archives for all
 platforms (with `SHA256SUMS`) are on the same page.
+
+See [docs/CHANGELOG.md](docs/CHANGELOG.md) for release history.
 
 ### Upgrade
 
@@ -201,8 +203,8 @@ otherwise pass `--delkey`.
 
 ## License
 
-GPL-3.0-only; see [LICENSE](LICENSE). Derived from the GPL-licensed Python
-projects [`Sraq-Zit/gfile`](https://github.com/Sraq-Zit/gfile) and
-[`fireattack/gfile`](https://github.com/fireattack/gfile) — see
-[NOTICE.md](NOTICE.md). Corresponding source for a binary release is this
-repository at the matching tag.
+MIT — see [LICENSE](LICENSE).
+
+The GigaFile.nu protocol flow was originally worked out with reference to
+[`Sraq-Zit/gfile`](https://github.com/Sraq-Zit/gfile) and its fork
+[`fireattack/gfile`](https://github.com/fireattack/gfile). Thanks!

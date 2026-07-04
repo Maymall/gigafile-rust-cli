@@ -7,6 +7,20 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-04
+
+### Added
+
+- Limit active segmented download workers and adapt downward after retryable
+  segment failures, while preserving the requested segment count for resume
+  metadata.
+- Include atomic sidecar temp files (`.part.json.tmp`) in `parts list` and
+  `parts clean` grouping.
+
+### Changed
+
+- Relicense from GPL-3.0-only to MIT.
+
 ## [0.9.3] - 2026-07-04
 
 ### Changed

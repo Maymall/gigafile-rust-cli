@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -668,6 +668,46 @@ async fn download_segment_retries_5xx_then_succeeds() {
 
     assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
     assert_eq!(first_range_failures.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn download_threads_throttle_segment_retries_under_range_pressure() {
+    let body = binary_body(96 * 1024);
+    let (server_uri, counters) = start_range_pressure_server(
+        include_str!("fixtures/single_basic.html")
+            .as_bytes()
+            .to_vec(),
+        body.clone(),
+        2,
+    );
+    let temp = TempDir::new().unwrap();
+    let opts = DownloadOptions {
+        url: format!("{server_uri}/{FILE_ID}"),
+        output: Some(temp.path().to_owned()),
+        force: false,
+        no_resume: false,
+        key: None,
+        selection: None,
+        threads: 8,
+        timeout: Duration::from_secs(10),
+        retries: 3,
+        user_agent: None,
+        dump_page: None,
+        quiet: true,
+        allow_any_host: true,
+    };
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(outcome.threads, Some(8));
+    assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
+    assert_eq!(counters.non_range_requests.load(Ordering::SeqCst), 0);
+    assert!(counters.rejected_ranges.load(Ordering::SeqCst) > 0);
+    assert!(
+        counters.max_inflight_ranges.load(Ordering::SeqCst) <= 4,
+        "segment scheduler exceeded active Range cap"
+    );
 }
 
 #[tokio::test]
@@ -1820,6 +1860,128 @@ fn start_header_capture_server(
         }
     });
     (format!("http://{addr}"), captured)
+}
+
+#[derive(Clone)]
+struct RangePressureCounters {
+    inflight_ranges: Arc<AtomicUsize>,
+    max_inflight_ranges: Arc<AtomicUsize>,
+    rejected_ranges: Arc<AtomicUsize>,
+    non_range_requests: Arc<AtomicUsize>,
+}
+
+fn start_range_pressure_server(
+    page_body: Vec<u8>,
+    file_body: Vec<u8>,
+    max_active_ranges: usize,
+) -> (String, RangePressureCounters) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let page_body = Arc::new(page_body);
+    let file_body = Arc::new(file_body);
+    let counters = RangePressureCounters {
+        inflight_ranges: Arc::new(AtomicUsize::new(0)),
+        max_inflight_ranges: Arc::new(AtomicUsize::new(0)),
+        rejected_ranges: Arc::new(AtomicUsize::new(0)),
+        non_range_requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let server_counters = counters.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(64) {
+            let stream = stream.unwrap();
+            let page_body = Arc::clone(&page_body);
+            let file_body = Arc::clone(&file_body);
+            let counters = server_counters.clone();
+            std::thread::spawn(move || {
+                handle_range_pressure_stream(
+                    stream,
+                    page_body,
+                    file_body,
+                    counters,
+                    max_active_ranges,
+                );
+            });
+        }
+    });
+    (format!("http://{addr}"), counters)
+}
+
+fn handle_range_pressure_stream(
+    mut stream: std::net::TcpStream,
+    page_body: Arc<Vec<u8>>,
+    file_body: Arc<Vec<u8>>,
+    counters: RangePressureCounters,
+    max_active_ranges: usize,
+) {
+    let mut request = [0_u8; 4096];
+    let read = stream.read(&mut request).unwrap();
+    let request = String::from_utf8_lossy(&request[..read]);
+    if request.starts_with(&format!("GET /{FILE_ID} ")) {
+        write_response(
+            &mut stream,
+            "text/html",
+            page_body.len(),
+            page_body.as_slice(),
+        );
+        return;
+    }
+
+    let Some((start, end)) = raw_range_header(&request) else {
+        counters.non_range_requests.fetch_add(1, Ordering::SeqCst);
+        write_status_response(&mut stream, "500 Internal Server Error");
+        return;
+    };
+
+    let inflight = counters.inflight_ranges.fetch_add(1, Ordering::SeqCst) + 1;
+    counters
+        .max_inflight_ranges
+        .fetch_max(inflight, Ordering::SeqCst);
+    if inflight > max_active_ranges {
+        counters.rejected_ranges.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        write_status_response(&mut stream, "503 Service Unavailable");
+        counters.inflight_ranges.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+
+    std::thread::sleep(Duration::from_millis(80));
+    write_raw_range_response(&mut stream, file_body.as_slice(), start, end);
+    counters.inflight_ranges.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn raw_range_header(request: &str) -> Option<(u64, u64)> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("range") {
+            return None;
+        }
+        let value = value.trim().strip_prefix("bytes=")?;
+        let (start, end) = value.split_once('-')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
+    })
+}
+
+fn write_status_response(stream: &mut std::net::TcpStream, status: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    stream.flush().unwrap();
+}
+
+fn write_raw_range_response(stream: &mut std::net::TcpStream, body: &[u8], start: u64, end: u64) {
+    let start = start as usize;
+    let end = end as usize;
+    write!(
+        stream,
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        body.len(),
+        end - start + 1
+    )
+    .unwrap();
+    stream.write_all(&body[start..=end]).unwrap();
+    stream.flush().unwrap();
 }
 
 fn write_response(stream: &mut std::net::TcpStream, content_type: &str, len: usize, body: &[u8]) {

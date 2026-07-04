@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fs::{File as StdFile, OpenOptions as StdOpenOptions},
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -10,6 +10,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,13 @@ pub const DEFAULT_DOWNLOAD_THREADS: u8 = 1;
 pub const MIN_DOWNLOAD_THREADS: u8 = 1;
 pub const MAX_DOWNLOAD_THREADS: u8 = 16;
 const THREADS_RESUME_HINT: &str = "This often happens when a previous attempt used a different --threads value; rerun with the same --threads to resume, or accept the restart.";
+// LT-9 (2026-07-04): short live probes did not show a stable throughput gain
+// above four simultaneous Range streams, while prior user traces showed retry
+// storms at eight. Keep the user-requested segment count for resume geometry,
+// but only admit a conservative number of active segment requests at once.
+const MAX_ACTIVE_SEGMENT_WORKERS: usize = 4;
+const MIN_ADAPTIVE_SEGMENT_WORKERS: usize = 2;
+const SEGMENT_SUCCESSES_BEFORE_PROBE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
@@ -218,6 +226,24 @@ struct SegmentContext {
     timeout: Duration,
     progress: SegmentedProgress,
     shared_segments: Arc<Mutex<Vec<SegmentState>>>,
+}
+
+struct SegmentWork {
+    index: usize,
+    attempt: u32,
+    delay: Option<Duration>,
+    initial: Option<InitialSegmentWork>,
+}
+
+struct InitialSegmentWork {
+    range_start: u64,
+    response: reqwest::Response,
+}
+
+struct SegmentWorkResult {
+    index: usize,
+    attempt: u32,
+    result: Result<(), SegmentDownloadError>,
 }
 
 struct DownloadLock {
@@ -1207,48 +1233,11 @@ async fn try_download_file_segmented(
         progress: progress.clone(),
         shared_segments: Arc::clone(&shared_segments),
     };
-    let mut handles = Vec::new();
-    let initial_index = initial.index;
-    let initial_context = context.clone();
-    handles.push(tokio::spawn(async move {
-        consume_segment_response(
-            &initial_context,
-            initial.index,
-            initial.range_start,
-            initial.response,
-        )
-        .await
-    }));
-    for (index, segment) in segment_resume.segments.iter().enumerate() {
-        if index == initial_index || segment.done {
-            continue;
-        }
-        let context = context.clone();
-        let retries = options.retries;
-        handles.push(tokio::spawn(async move {
-            download_segment_with_retries(context, index, retries).await
-        }));
-    }
-
-    let mut first_worker_error = None;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if first_worker_error.is_none() => {
-                first_worker_error = Some(error);
-            }
-            Ok(Err(_)) => {}
-            Err(source) => {
-                if first_worker_error.is_none() {
-                    first_worker_error = Some(SegmentDownloadError::Failed(GfileError::Network {
-                        source: boxed(source),
-                        context: "joining segmented download worker".to_owned(),
-                    }));
-                }
-            }
-        }
-    }
-    if let Some(error) = first_worker_error {
+    let initial_limit = active_segment_limit(segment_resume.segments.len());
+    let pending = pending_segment_work(&segment_resume.segments, initial);
+    if let Some(error) =
+        run_segment_scheduler(context.clone(), pending, options.retries, initial_limit).await
+    {
         return Err(error);
     }
     progress.finish();
@@ -1303,32 +1292,150 @@ async fn try_download_file_segmented(
     })
 }
 
-async fn download_segment_with_retries(
+fn active_segment_limit(segment_count: usize) -> usize {
+    segment_count
+        .min(MAX_ACTIVE_SEGMENT_WORKERS)
+        .max(DEFAULT_DOWNLOAD_THREADS as usize)
+}
+
+fn pending_segment_work(
+    segments: &[SegmentState],
+    initial: InitialSegmentResponse,
+) -> VecDeque<SegmentWork> {
+    let mut pending = VecDeque::with_capacity(segments.len());
+    let initial_index = initial.index;
+    pending.push_back(SegmentWork {
+        index: initial.index,
+        attempt: 0,
+        delay: None,
+        initial: Some(InitialSegmentWork {
+            range_start: initial.range_start,
+            response: initial.response,
+        }),
+    });
+    for (index, segment) in segments.iter().enumerate() {
+        if index == initial_index || segment.done {
+            continue;
+        }
+        pending.push_back(SegmentWork {
+            index,
+            attempt: 0,
+            delay: None,
+            initial: None,
+        });
+    }
+    pending
+}
+
+async fn run_segment_scheduler(
     context: SegmentContext,
-    index: usize,
+    mut pending: VecDeque<SegmentWork>,
     retries: u32,
-) -> Result<(), SegmentDownloadError> {
-    let mut attempt = 0;
+    initial_limit: usize,
+) -> Option<SegmentDownloadError> {
+    let mut active = FuturesUnordered::new();
+    let mut active_limit = initial_limit;
+    let mut first_error = None;
+    let mut consecutive_successes = 0_usize;
+
+    for work in &pending {
+        mark_segment_waiting(&context, work.index);
+    }
+
     loop {
-        match try_download_segment(&context, index).await {
-            Ok(()) => return Ok(()),
+        while active.len() < active_limit {
+            let Some(work) = pending.pop_front() else {
+                break;
+            };
+            mark_segment_active(&context, work.index);
+            active.push(run_segment_work(context.clone(), work));
+        }
+
+        if active.is_empty() {
+            break;
+        }
+
+        let Some(work_result) = active.next().await else {
+            break;
+        };
+        match work_result.result {
+            Ok(()) => {
+                consecutive_successes += 1;
+                if active_limit < initial_limit
+                    && consecutive_successes >= SEGMENT_SUCCESSES_BEFORE_PROBE
+                {
+                    active_limit += 1;
+                    consecutive_successes = 0;
+                }
+            }
             Err(SegmentDownloadError::Fallback(reason)) => {
-                return Err(SegmentDownloadError::Fallback(reason));
+                return Some(SegmentDownloadError::Fallback(reason));
             }
             Err(SegmentDownloadError::Failed(error))
-                if http::is_retryable(&error) && attempt < retries =>
+                if http::is_retryable(&error) && work_result.attempt < retries =>
             {
                 warn!(
                     "retrying download segment {} after error: {}",
-                    index + 1,
+                    work_result.index + 1,
                     error.user_message()
                 );
-                tokio::time::sleep(http::retry_delay(attempt)).await;
-                attempt += 1;
+                consecutive_successes = 0;
+                if active_limit > MIN_ADAPTIVE_SEGMENT_WORKERS {
+                    active_limit = (active_limit / 2).max(MIN_ADAPTIVE_SEGMENT_WORKERS);
+                }
+                mark_segment_waiting(&context, work_result.index);
+                active.push(run_segment_work(
+                    context.clone(),
+                    SegmentWork {
+                        index: work_result.index,
+                        attempt: work_result.attempt + 1,
+                        delay: Some(http::retry_delay(work_result.attempt)),
+                        initial: None,
+                    },
+                ));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                consecutive_successes = 0;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
+
+    first_error
+}
+
+async fn run_segment_work(context: SegmentContext, work: SegmentWork) -> SegmentWorkResult {
+    if let Some(delay) = work.delay {
+        mark_segment_waiting(&context, work.index);
+        tokio::time::sleep(delay).await;
+    }
+    mark_segment_active(&context, work.index);
+    let result = match work.initial {
+        Some(initial) => {
+            consume_segment_response(&context, work.index, initial.range_start, initial.response)
+                .await
+        }
+        None => try_download_segment(&context, work.index).await,
+    };
+    SegmentWorkResult {
+        index: work.index,
+        attempt: work.attempt,
+        result,
+    }
+}
+
+fn mark_segment_waiting(context: &SegmentContext, index: usize) {
+    context
+        .progress
+        .set_segment_message(index, format!("conn {} waiting", index + 1));
+}
+
+fn mark_segment_active(context: &SegmentContext, index: usize) {
+    context
+        .progress
+        .set_segment_message(index, format!("conn {}", index + 1));
 }
 
 async fn try_download_segment(

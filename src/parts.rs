@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MIT
 
 use std::{
     collections::BTreeMap,
@@ -30,6 +30,7 @@ pub struct PartGroup {
     pub target_path: PathBuf,
     pub part_path: Option<PathBuf>,
     pub sidecar_path: Option<PathBuf>,
+    pub sidecar_tmp_path: Option<PathBuf>,
     pub lock_path: Option<PathBuf>,
     pub state: PartState,
     pub active: bool,
@@ -75,6 +76,7 @@ pub struct CleanFailure {
 struct GroupBuilder {
     part_path: Option<PathBuf>,
     sidecar_path: Option<PathBuf>,
+    sidecar_tmp_path: Option<PathBuf>,
     lock_path: Option<PathBuf>,
 }
 
@@ -82,6 +84,7 @@ struct GroupBuilder {
 enum PartFileKind {
     Part,
     Sidecar,
+    SidecarTmp,
     Lock,
 }
 
@@ -103,6 +106,7 @@ pub fn list(dir: PathBuf) -> Result<PartsReport, GfileError> {
         match kind {
             PartFileKind::Part => builder.part_path = Some(path),
             PartFileKind::Sidecar => builder.sidecar_path = Some(path),
+            PartFileKind::SidecarTmp => builder.sidecar_tmp_path = Some(path),
             PartFileKind::Lock => builder.lock_path = Some(path),
         }
     }
@@ -186,13 +190,14 @@ fn build_group(
     let state = match (
         &builder.part_path,
         &builder.sidecar_path,
+        &builder.sidecar_tmp_path,
         &builder.lock_path,
     ) {
-        (Some(_), Some(_), _) => PartState::Resumable,
-        (Some(_), None, _) => PartState::PartWithoutSidecar,
-        (None, Some(_), _) => PartState::SidecarWithoutPart,
-        (None, None, Some(_)) => PartState::LockOnly,
-        (None, None, None) => PartState::LockOnly,
+        (Some(_), Some(_), _, _) => PartState::Resumable,
+        (Some(_), None, _, _) => PartState::PartWithoutSidecar,
+        (None, Some(_), _, _) | (None, None, Some(_), _) => PartState::SidecarWithoutPart,
+        (None, None, None, Some(_)) => PartState::LockOnly,
+        (None, None, None, None) => PartState::LockOnly,
     };
     let active = builder
         .lock_path
@@ -215,6 +220,7 @@ fn build_group(
     let paths = [
         builder.part_path.as_ref(),
         builder.sidecar_path.as_ref(),
+        builder.sidecar_tmp_path.as_ref(),
         builder.lock_path.as_ref(),
     ];
     let disk_bytes = paths
@@ -238,6 +244,7 @@ fn build_group(
         target_path,
         part_path: builder.part_path,
         sidecar_path: builder.sidecar_path,
+        sidecar_tmp_path: builder.sidecar_tmp_path,
         lock_path: builder.lock_path,
         state,
         active,
@@ -252,6 +259,9 @@ fn build_group(
 fn classify_part_file(file_name: &str) -> Option<(String, PartFileKind)> {
     if let Some(target) = file_name.strip_suffix(".part.json.lock") {
         return (!target.is_empty()).then(|| (target.to_owned(), PartFileKind::Lock));
+    }
+    if let Some(target) = file_name.strip_suffix(".part.json.tmp") {
+        return (!target.is_empty()).then(|| (target.to_owned(), PartFileKind::SidecarTmp));
     }
     if let Some(target) = file_name.strip_suffix(".part.json") {
         return (!target.is_empty()).then(|| (target.to_owned(), PartFileKind::Sidecar));
@@ -304,6 +314,7 @@ fn group_paths(group: &PartGroup) -> Vec<PathBuf> {
     [
         group.part_path.clone(),
         group.sidecar_path.clone(),
+        group.sidecar_tmp_path.clone(),
         group.lock_path.clone(),
     ]
     .into_iter()
@@ -354,10 +365,12 @@ mod tests {
         write_v2(temp.path().join("seg.bin.part.json"), 200, 50);
         fs::write(temp.path().join("seg.bin.part"), vec![0_u8; 200]).unwrap();
         fs::write(temp.path().join("old.bin.part.json.lock"), b"").unwrap();
+        fs::write(temp.path().join("tmp.bin.part"), vec![0_u8; 5]).unwrap();
+        fs::write(temp.path().join("tmp.bin.part.json.tmp"), b"pending").unwrap();
 
         let report = list(temp.path().to_owned()).unwrap();
 
-        assert_eq!(report.groups.len(), 4);
+        assert_eq!(report.groups.len(), 5);
         let seq = group(&report, "seq.bin");
         assert_eq!(seq.state, PartState::Resumable);
         assert_eq!(seq.completed_bytes, Some(40));
@@ -370,6 +383,10 @@ mod tests {
             PartState::PartWithoutSidecar
         );
         assert_eq!(group(&report, "old.bin").state, PartState::LockOnly);
+        let tmp = group(&report, "tmp.bin");
+        let tmp_sidecar = temp.path().join("tmp.bin.part.json.tmp");
+        assert_eq!(tmp.state, PartState::PartWithoutSidecar);
+        assert_eq!(tmp.sidecar_tmp_path.as_deref(), Some(tmp_sidecar.as_path()));
     }
 
     #[test]
@@ -380,6 +397,7 @@ mod tests {
         fs::write(&active_lock, b"").unwrap();
         fs::write(temp.path().join("stale.bin.part"), b"stale").unwrap();
         fs::write(temp.path().join("stale.bin.part.json.lock"), b"").unwrap();
+        fs::write(temp.path().join("stale.bin.part.json.tmp"), b"tmp").unwrap();
 
         let lock_file = OpenOptions::new()
             .read(true)
@@ -394,6 +412,7 @@ mod tests {
         assert_eq!(clean_report.skipped_active.len(), 1);
         assert!(temp.path().join("active.bin.part").exists());
         assert!(!temp.path().join("stale.bin.part").exists());
+        assert!(!temp.path().join("stale.bin.part.json.tmp").exists());
 
         FileExt::unlock(&lock_file).unwrap();
     }
