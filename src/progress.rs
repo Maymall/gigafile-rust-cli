@@ -89,7 +89,7 @@ impl SegmentedProgress {
         label: &str,
         segments: &[SegmentProgressSpec],
     ) -> Self {
-        Self::new_with_segment_label(total, quiet, label, segments, "conn")
+        Self::new_with_options(total, quiet, label, segments, "conn", true)
     }
 
     pub fn new_with_segment_label(
@@ -98,6 +98,17 @@ impl SegmentedProgress {
         label: &str,
         segments: &[SegmentProgressSpec],
         segment_label: &str,
+    ) -> Self {
+        Self::new_with_options(total, quiet, label, segments, segment_label, false)
+    }
+
+    fn new_with_options(
+        total: Option<u64>,
+        quiet: bool,
+        label: &str,
+        segments: &[SegmentProgressSpec],
+        segment_label: &str,
+        segment_speed: bool,
     ) -> Self {
         let segment_totals = segments
             .iter()
@@ -119,6 +130,7 @@ impl SegmentedProgress {
                     &segment_totals,
                     &segment_positions,
                     segment_label,
+                    segment_speed,
                 )
             })
         };
@@ -225,6 +237,7 @@ fn segmented_bars(
     segment_totals: &[u64],
     segment_positions: &[u64],
     segment_label: &str,
+    segment_speed: bool,
 ) -> SegmentedBars {
     let multi = MultiProgress::new();
     let main = multi.add(
@@ -246,7 +259,7 @@ fn segmented_bars(
         let bar = multi.insert_after(
             &previous,
             ProgressBar::new(total)
-                .with_style(segment_style())
+                .with_style(segment_style(segment_speed))
                 .with_prefix(prefix.to_owned())
                 .with_message(format!("{segment_label} {}", index + 1)),
         );
@@ -267,14 +280,19 @@ fn segmented_bars(
 
 fn main_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
+        "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("=> ")
 }
 
-fn segment_style() -> ProgressStyle {
-    ProgressStyle::with_template("{prefix} {msg} [{bar:24.white/blue}] {bytes}/{total_bytes}")
+fn segment_style(show_speed: bool) -> ProgressStyle {
+    let template = if show_speed {
+        "{prefix} {msg} [{bar:24.white/blue}] {bytes}/{total_bytes} {bytes_per_sec}"
+    } else {
+        "{prefix} {msg} [{bar:24.white/blue}] {bytes}/{total_bytes}"
+    };
+    ProgressStyle::with_template(template)
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=> ")
 }

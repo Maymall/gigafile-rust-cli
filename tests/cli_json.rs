@@ -69,6 +69,30 @@ fn snapshot_info_help() {
     insta::assert_snapshot!(stdout);
 }
 
+#[test]
+fn snapshot_config_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "config", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
+}
+
+#[test]
+fn snapshot_config_init_help() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "config", "init", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    insta::assert_snapshot!(normalize_help(&output.stdout));
+}
+
 #[tokio::test]
 async fn snapshot_json_single_success() {
     let server = MockServer::start().await;

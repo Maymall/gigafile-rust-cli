@@ -1,0 +1,19 @@
+---
+source: tests/cli_json.rs
+expression: normalize_help(&output.stdout)
+---
+Create a configuration file
+
+Usage: rgfile config init [OPTIONS]
+
+Options:
+      --defaults  Write a commented defaults template without prompting
+      --force     Overwrite an existing configuration file
+  -h, --help      Print help
+
+Global Options:
+  -v, --verbose...     Increase logging verbosity (-v for info, -vv for debug)
+      --config <PATH>  Load configuration from a specific TOML file
+      --no-config      Do not load a configuration file
+      --history        Enable history for this run
+      --no-history     Disable history for this run

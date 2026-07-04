@@ -7,6 +7,14 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-04
+
+### Added
+
+- Add `rgfile config path`, `rgfile config show`, and `rgfile config init` for inspecting and creating configuration files.
+- Add interactive config creation for common settings plus `config init --defaults` for a commented template.
+- Show per-connection speeds on segmented download child progress bars and use second-precise ETA on the main progress bar.
+
 ## [0.6.0] - 2026-07-04
 
 ### Added

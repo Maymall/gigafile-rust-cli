@@ -11,6 +11,7 @@ Commands:
   info         Show metadata for a public GigaFile page without downloading files
   upload       Upload a local file
   history      Inspect or clear local history
+  config       Inspect or create the rgfile configuration file
   self-update  Update this rgfile binary from the latest GitHub Release
   completions  Generate shell completion scripts
   help         Print this message or the help of the given subcommand(s)

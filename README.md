@@ -92,6 +92,12 @@ Optional TOML file at `~/.config/rgfile/config.toml` (Linux),
 `%APPDATA%\rgfile\config.toml` (Windows). CLI options override config values;
 `--config <path>` loads a specific file, `--no-config` skips loading.
 
+Use `rgfile config init` to create a config interactively, or
+`rgfile config init --defaults` to write a commented defaults template without
+prompting. `rgfile config show` prints the effective values and where each one
+came from; add `--json` for machine-readable output. `rgfile config path`
+prints the path rgfile will use, even before the file exists.
+
 ```toml
 [download]
 dir = "/home/alice/Downloads"  # default output directory

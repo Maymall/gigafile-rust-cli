@@ -193,6 +193,230 @@ fn config_syntax_error_exits_2_with_line_number() {
         .stderr(predicate::str::contains("line 2"));
 }
 
+#[test]
+fn config_path_prints_override_even_when_missing() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("missing").join("config.toml");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(config.display().to_string()))
+        .stderr(predicate::str::contains("file does not exist yet"));
+}
+
+#[test]
+fn config_path_ignores_no_config_flag() {
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "config", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config.toml"));
+}
+
+#[test]
+fn config_show_missing_file_reports_default_and_unset_sources() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("missing.toml");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no config file found"))
+        .stdout(predicate::str::contains("download.dir = <unset> (unset)"))
+        .stdout(predicate::str::contains("download.threads = 1 (default)"))
+        .stdout(predicate::str::contains(
+            "network.user_agent = <unset> (unset)",
+        ));
+}
+
+#[test]
+fn config_show_no_config_reports_no_config_source() {
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-config (using defaults)"))
+        .stdout(predicate::str::contains("exists: false"))
+        .stdout(predicate::str::contains("download.threads = 1 (default)"));
+}
+
+#[test]
+fn config_show_invalid_config_exits_2_with_line_number() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(&temp, "[network]\ntimeout =\n");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(config)
+        .args(["config", "show"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("line 2"));
+}
+
+#[test]
+fn config_show_file_reports_file_sources() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().join("downloads");
+    let config = write_config(
+        &temp,
+        &format!(
+            "[download]\ndir = \"{}\"\nthreads = 4\n\n[upload]\nlifetime = 7\nthreads = 3\n\n[network]\ntimeout = 9\nretries = 1\nuser_agent = \"rgfile-config-test\"\n\n[history]\nenabled = true\nstore_delete_keys = true\n",
+            toml_path(&dir)
+        ),
+    );
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("loaded from"))
+        .stdout(predicate::str::contains("download.threads = 4 (file)"))
+        .stdout(predicate::str::contains("upload.lifetime = 7 (file)"))
+        .stdout(predicate::str::contains(
+            "network.user_agent = rgfile-config-test (file)",
+        ))
+        .stdout(predicate::str::contains(
+            "history.store_delete_keys = true (file)",
+        ));
+}
+
+#[test]
+fn config_show_json_reports_values_and_sources() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path().join("downloads");
+    let config = write_config(
+        &temp,
+        &format!(
+            "[download]\ndir = \"{}\"\nthreads = 5\n\n[network]\nretries = 0\n",
+            toml_path(&dir)
+        ),
+    );
+
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "show", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["exists"], true);
+    assert_eq!(value["source"], "file");
+    assert_eq!(value["values"]["download"]["dir"]["source"], "file");
+    assert_eq!(
+        value["values"]["download"]["dir"]["value"],
+        dir.display().to_string()
+    );
+    assert_eq!(value["values"]["download"]["threads"]["value"], 5);
+    assert_eq!(value["values"]["network"]["retries"]["source"], "file");
+    assert_eq!(value["values"]["network"]["timeout"]["source"], "default");
+    assert_eq!(value["values"]["network"]["user_agent"]["source"], "unset");
+}
+
+#[test]
+fn config_init_defaults_writes_template_that_loads_as_defaults() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("nested").join("config.toml");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "init", "--defaults"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(config.display().to_string()))
+        .stderr(predicate::str::contains("rgfile config show"));
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("# threads = 1"));
+    assert!(text.contains("[network]"));
+
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "show", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["values"]["download"]["threads"]["source"], "default");
+    assert_eq!(value["values"]["upload"]["lifetime"]["value"], 100);
+    assert_eq!(value["values"]["history"]["enabled"]["source"], "default");
+}
+
+#[test]
+fn config_init_defaults_existing_requires_force() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(&temp, "[download]\nthreads = 2\n");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "init", "--defaults"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--force"));
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("threads = 2"));
+}
+
+#[test]
+fn config_init_defaults_force_overwrites_existing_file() {
+    let temp = TempDir::new().unwrap();
+    let config = write_config(&temp, "[download]\nthreads = 2\n");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "init", "--defaults", "--force"])
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("# threads = 1"));
+    assert!(!text.contains("threads = 2"));
+}
+
+#[test]
+fn config_init_interactive_non_tty_exits_2() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config.toml");
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args(["config", "init"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--defaults"));
+}
+
 #[tokio::test]
 async fn history_default_off_and_no_history_override_do_not_write() {
     let server = MockServer::start().await;
