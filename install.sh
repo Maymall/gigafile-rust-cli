@@ -107,8 +107,9 @@ extract_release_binary() {
         err "cannot safely extract $member"
     fi
     binary_size=$(wc -c <"$output")
-    [ "$binary_size" -gt 0 ] && [ "$binary_size" -le "$MAX_BINARY_BYTES" ] ||
+    if [ "$binary_size" -le 0 ] || [ "$binary_size" -gt "$MAX_BINARY_BYTES" ]; then
         err "archive binary has an invalid size"
+    fi
 }
 
 command -v curl >/dev/null 2>&1 || err "curl is required"

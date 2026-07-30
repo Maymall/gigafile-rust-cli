@@ -546,7 +546,7 @@ fn system_time_unix(time: SystemTime) -> Option<u64> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     use std::os::unix::ffi::OsStringExt as _;
 
     #[test]
@@ -755,7 +755,7 @@ mod tests {
         FileExt::unlock(&lock_file).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn list_and_clean_preserve_non_utf8_target_names() {
         let temp = tempfile::TempDir::new().unwrap();
