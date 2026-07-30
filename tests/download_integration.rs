@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
+    collections::HashMap,
     io::{Read, Seek, SeekFrom, Write},
     net::TcpListener,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rgfile::{
@@ -22,6 +23,7 @@ use wiremock::{
 };
 
 const FILE_ID: &str = "0123abcd-000000example";
+const TEST_ETAG: &str = "\"rgfile-test-etag\"";
 
 #[tokio::test]
 async fn download_single_success_writes_final_and_cleans_part_files() {
@@ -52,6 +54,109 @@ async fn download_single_success_writes_final_and_cleans_part_files() {
             .with_file_name("example file.bin.part.json")
             .exists()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_sequential_refuses_part_symlink_without_touching_victim() {
+    use std::os::unix::fs::symlink;
+
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(10 * 1024);
+    mount_file(&server, 200, body.clone(), Some(body.len()), None).await;
+    let temp = TempDir::new().unwrap();
+    let victim_path = temp.path().join("victim.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let final_path = temp.path().join("example file.bin");
+    let victim_contents = b"must not be truncated";
+    std::fs::write(&victim_path, victim_contents).unwrap();
+    symlink(&victim_path, &part_path).unwrap();
+
+    let error = download(options(&server, &temp, 0))
+        .await
+        .expect_err("a partial-download symlink must be rejected");
+
+    assert!(matches!(error, GfileError::Io { .. }));
+    assert_eq!(std::fs::read(&victim_path).unwrap(), victim_contents);
+    assert!(
+        std::fs::symlink_metadata(&part_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!final_path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_sequential_refuses_part_hard_link_without_touching_victim() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(10 * 1024);
+    mount_file(&server, 200, body.clone(), Some(body.len()), None).await;
+    let temp = TempDir::new().unwrap();
+    let victim_path = temp.path().join("victim.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let final_path = temp.path().join("example file.bin");
+    let victim_contents = b"must not be truncated through a hard link";
+    std::fs::write(&victim_path, victim_contents).unwrap();
+    std::fs::hard_link(&victim_path, &part_path).unwrap();
+
+    let error = download(options(&server, &temp, 0))
+        .await
+        .expect_err("a partial-download hard link must be rejected");
+
+    assert!(matches!(error, GfileError::Io { .. }));
+    assert_eq!(std::fs::read(&victim_path).unwrap(), victim_contents);
+    assert_eq!(std::fs::read(&part_path).unwrap(), victim_contents);
+    assert!(!final_path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_segmented_refuses_part_symlink_without_touching_victim() {
+    use std::os::unix::fs::symlink;
+
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(16 * 1024);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some((start, end)) = range_header(request) {
+                range_response(&responder_body, start, end)
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let victim_path = temp.path().join("victim.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let final_path = temp.path().join("example file.bin");
+    let victim_contents = b"must not be resized";
+    std::fs::write(&victim_path, victim_contents).unwrap();
+    symlink(&victim_path, &part_path).unwrap();
+    let mut opts = options(&server, &temp, 0);
+    opts.threads = 4;
+
+    let error = download(opts)
+        .await
+        .expect_err("a segmented partial-download symlink must be rejected");
+
+    assert!(matches!(error, GfileError::Io { .. }));
+    assert_eq!(std::fs::read(&victim_path).unwrap(), victim_contents);
+    assert!(
+        std::fs::symlink_metadata(&part_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!final_path.exists());
 }
 
 #[tokio::test]
@@ -258,6 +363,7 @@ async fn download_resume_uses_content_disposition_name_for_masked_page() {
                             responder_body.len()
                         ),
                     )
+                    .insert_header("ETag", TEST_ETAG)
                     .insert_header(
                         "Content-Length",
                         (responder_body.len() as u64 - start).to_string(),
@@ -711,6 +817,54 @@ async fn download_threads_throttle_segment_retries_under_range_pressure() {
 }
 
 #[tokio::test]
+async fn download_segment_retries_wait_outside_active_limit_after_throttle() {
+    let body = binary_body(96 * 1024);
+    let (server_uri, counters) = start_adaptive_retry_server(
+        include_str!("fixtures/single_basic.html")
+            .as_bytes()
+            .to_vec(),
+        body.clone(),
+    );
+    let temp = TempDir::new().unwrap();
+    let opts = DownloadOptions {
+        url: format!("{server_uri}/{FILE_ID}"),
+        output: Some(temp.path().to_owned()),
+        force: false,
+        no_resume: false,
+        key: None,
+        selection: None,
+        threads: 8,
+        timeout: Duration::from_secs(10),
+        retries: 3,
+        user_agent: None,
+        dump_page: None,
+        quiet: true,
+        allow_any_host: true,
+    };
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(outcome.path.as_ref().unwrap()).unwrap(), body);
+    assert!(
+        counters.retried_ranges.load(Ordering::SeqCst) >= 2,
+        "the pressure responses should exercise delayed retries"
+    );
+    assert!(
+        counters.max_inflight_during_throttle.load(Ordering::SeqCst) <= 2,
+        "ready-at retries bypassed the reduced active limit"
+    );
+    let throttle_closed = counters.throttle_closed_ms.load(Ordering::SeqCst);
+    let first_retry = counters.first_retry_started_ms.load(Ordering::SeqCst);
+    assert!(throttle_closed > 0, "the throttle window was not recorded");
+    assert!(first_retry > 0, "no retry start time was recorded");
+    assert!(
+        first_retry >= throttle_closed,
+        "a retry started at {first_retry} ms before the reduced-limit window closed at {throttle_closed} ms"
+    );
+}
+
+#[tokio::test]
 async fn download_threads_falls_back_when_range_returns_200() {
     let server = MockServer::start().await;
     mount_page(&server, include_str!("fixtures/single_basic.html")).await;
@@ -1103,6 +1257,68 @@ async fn download_threads_discards_v1_sidecar_and_restarts_segmented() {
 }
 
 #[tokio::test]
+async fn download_threads_sidecar_without_validator_restarts_from_zero() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let body = binary_body(24 * 1024);
+    let ranges = expected_ranges(body.len() as u64, 4);
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, vec![0_u8; body.len()]).unwrap();
+    write_body_range(&part_path, &body, ranges[0].0, ranges[0].1).unwrap();
+    write_segment_sidecar(
+        &sidecar_path,
+        FILE_ID,
+        body.len() as u64,
+        false,
+        &[
+            (
+                ranges[0].0,
+                ranges[0].1,
+                true,
+                ranges[0].1 - ranges[0].0 + 1,
+            ),
+            (ranges[1].0, ranges[1].1, false, 0),
+            (ranges[2].0, ranges[2].1, false, 0),
+            (ranges[3].0, ranges[3].1, false, 0),
+        ],
+    );
+    remove_sidecar_validator(&sidecar_path);
+    let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+    let responder_ranges = Arc::clone(&observed_ranges);
+    let responder_body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            if let Some((start, end)) = range_header(request) {
+                responder_ranges.lock().unwrap().push((start, end));
+                range_response(&responder_body, start, end)
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut opts = options(&server, &temp, 0);
+    opts.threads = 4;
+
+    let report = download(opts).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert!(!outcome.resumed);
+    assert_eq!(std::fs::read(&final_path).unwrap(), body);
+    let mut observed = observed_ranges.lock().unwrap().clone();
+    observed.sort_unstable();
+    assert_eq!(
+        observed,
+        expected_ranges_after_initial(body.len() as u64, 4, 2559)
+    );
+}
+
+#[tokio::test]
 async fn download_no_resume_clears_v2_segment_progress() {
     let server = MockServer::start().await;
     mount_page(&server, include_str!("fixtures/single_basic.html")).await;
@@ -1242,6 +1458,7 @@ async fn download_resume_206_appends_and_marks_resumed() {
         .respond_with(
             ResponseTemplate::new(206)
                 .insert_header("Content-Range", "bytes 5-9/10")
+                .insert_header("ETag", TEST_ETAG)
                 .insert_header("Content-Length", "5")
                 .insert_header("Content-Type", "application/octet-stream")
                 .set_body_bytes(b"world".to_vec()),
@@ -1304,7 +1521,11 @@ async fn download_resume_416_promotes_completed_part() {
         .and(path("/download.php"))
         .and(query_param("file", FILE_ID))
         .and(header("Range", "bytes=10-"))
-        .respond_with(ResponseTemplate::new(416))
+        .respond_with(
+            ResponseTemplate::new(416)
+                .insert_header("Content-Range", "bytes */10")
+                .insert_header("ETag", TEST_ETAG),
+        )
         .mount(&server)
         .await;
 
@@ -1314,6 +1535,55 @@ async fn download_resume_416_promotes_completed_part() {
     assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
     assert!(outcome.resumed);
     assert_eq!(outcome.bytes, Some(10));
+    assert!(!part_path.exists());
+    assert!(!sidecar_path.exists());
+}
+
+#[tokio::test]
+async fn download_resume_416_without_matching_total_restarts_from_zero() {
+    for content_range in [None, Some("not a content range"), Some("bytes */9")] {
+        assert_resume_416_restarts_from_zero(content_range).await;
+    }
+}
+
+async fn assert_resume_416_restarts_from_zero(content_range: Option<&'static str>) {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"stale-data").unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(10), false);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let response_requests = Arc::clone(&requests);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(move |request: &Request| {
+            response_requests.fetch_add(1, Ordering::SeqCst);
+            if open_ended_range_start(request) == Some(10) {
+                let response = ResponseTemplate::new(416).insert_header("ETag", TEST_ETAG);
+                match content_range {
+                    Some(value) => response.insert_header("Content-Range", value),
+                    None => response,
+                }
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "10")
+                    .insert_header("Content-Type", "application/octet-stream")
+                    .set_body_bytes(b"fresh-data".to_vec())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"fresh-data");
+    assert!(!outcome.resumed);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(!part_path.exists());
     assert!(!sidecar_path.exists());
 }
@@ -1351,6 +1621,43 @@ async fn download_bad_sidecar_restarts_from_zero_without_range() {
         .find(|request| request.url.path() == "/download.php")
         .unwrap();
     assert!(file_request.headers.get("range").is_none());
+}
+
+#[tokio::test]
+async fn download_sidecar_without_validator_restarts_from_zero_without_range() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/single_basic.html")).await;
+    let temp = TempDir::new().unwrap();
+    let final_path = temp.path().join("example file.bin");
+    let part_path = temp.path().join("example file.bin.part");
+    let sidecar_path = temp.path().join("example file.bin.part.json");
+    std::fs::write(&part_path, b"old").unwrap();
+    write_sidecar(&sidecar_path, FILE_ID, Some(10), false);
+    remove_sidecar_validator(&sidecar_path);
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "10")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"helloworld".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let report = download(options(&server, &temp, 0)).await.unwrap();
+    let outcome = only_file(&report);
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"helloworld");
+    assert!(!outcome.resumed);
+    let requests = server.received_requests().await.unwrap();
+    let file_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/download.php")
+        .unwrap();
+    assert!(file_request.headers.get("range").is_none());
+    assert!(file_request.headers.get("if-range").is_none());
 }
 
 #[tokio::test]
@@ -1400,6 +1707,91 @@ async fn download_matomete_continues_after_failure_and_keeps_serial_order() {
     );
     assert!(!temp.path().join("______.bin").exists());
     assert_eq!(order.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn download_matomete_force_does_not_overwrite_same_sanitized_target() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/matomete_two_files.html")).await;
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", FILE_ID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "5")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"first".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download.php"))
+        .and(query_param("file", "0123abcd-000000example-2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "6")
+                .insert_header("Content-Type", "application/octet-stream")
+                .set_body_bytes(b"second".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let target = temp.path().join("______.bin");
+    std::fs::write(&target, b"before batch").unwrap();
+    let mut opts = options(&server, &temp, 0);
+    opts.force = true;
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.failed, 1);
+    assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    assert!(report.files[0].error.is_none());
+    assert!(report.files[1].error.is_some());
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|request| {
+        request.url.path() == "/download.php"
+            && request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "file" && value == "0123abcd-000000example-2")
+    }));
+}
+
+#[tokio::test]
+async fn download_matomete_force_does_not_overwrite_same_header_target() {
+    let server = MockServer::start().await;
+    mount_page(&server, include_str!("fixtures/matomete_two_files.html")).await;
+    mount_named_file(&server, FILE_ID, "shared.bin", b"first".to_vec()).await;
+    mount_named_file(
+        &server,
+        "0123abcd-000000example-2",
+        "shared.bin",
+        b"second".to_vec(),
+    )
+    .await;
+    let temp = TempDir::new().unwrap();
+    let mut opts = options(&server, &temp, 0);
+    opts.force = true;
+
+    let report = download(opts).await.unwrap();
+
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        std::fs::read(temp.path().join("shared.bin")).unwrap(),
+        b"first"
+    );
+    assert!(report.files[0].error.is_none());
+    assert!(report.files[1].error.is_some());
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.url.path() == "/download.php"
+            && request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "file" && value == "0123abcd-000000example-2")
+    }));
 }
 
 #[tokio::test]
@@ -1688,7 +2080,11 @@ fn write_sidecar(path: &std::path::Path, file_id: &str, expected: Option<u64>, k
             "version": 1,
             "file_id": file_id,
             "expected": expected,
-            "key_used": key_used
+            "key_used": key_used,
+            "validator": {
+                "kind": "strong_etag",
+                "value": TEST_ETAG,
+            },
         })
         .to_string(),
     )
@@ -1720,11 +2116,22 @@ fn write_segment_sidecar(
             "file_id": file_id,
             "expected": expected,
             "key_used": key_used,
+            "validator": {
+                "kind": "strong_etag",
+                "value": TEST_ETAG,
+            },
             "segments": segments,
         })
         .to_string(),
     )
     .unwrap();
+}
+
+fn remove_sidecar_validator(path: &std::path::Path) {
+    let mut sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    sidecar.as_object_mut().unwrap().remove("validator");
+    std::fs::write(path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
 }
 
 fn write_body_range(
@@ -1760,6 +2167,7 @@ fn range_response(body: &[u8], start: u64, end: u64) -> ResponseTemplate {
             "Content-Range",
             format!("bytes {start}-{end}/{}", body.len()),
         )
+        .insert_header("ETag", TEST_ETAG)
         .insert_header("Content-Length", (end - start + 1).to_string())
         .insert_header("Content-Type", "application/octet-stream")
         .set_body_bytes(body[start as usize..=end as usize].to_vec())
@@ -1949,6 +2357,135 @@ fn handle_range_pressure_stream(
     counters.inflight_ranges.fetch_sub(1, Ordering::SeqCst);
 }
 
+#[derive(Clone)]
+struct AdaptiveRetryCounters {
+    started_at: Instant,
+    total_ranges: Arc<AtomicUsize>,
+    inflight_ranges: Arc<AtomicUsize>,
+    max_inflight_during_throttle: Arc<AtomicUsize>,
+    retried_ranges: Arc<AtomicUsize>,
+    first_retry_started_ms: Arc<AtomicU64>,
+    throttle_closed_ms: Arc<AtomicU64>,
+    attempts: Arc<Mutex<HashMap<(u64, u64), usize>>>,
+}
+
+fn start_adaptive_retry_server(
+    page_body: Vec<u8>,
+    file_body: Vec<u8>,
+) -> (String, AdaptiveRetryCounters) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let page_body = Arc::new(page_body);
+    let file_body = Arc::new(file_body);
+    let counters = AdaptiveRetryCounters {
+        started_at: Instant::now(),
+        total_ranges: Arc::new(AtomicUsize::new(0)),
+        inflight_ranges: Arc::new(AtomicUsize::new(0)),
+        max_inflight_during_throttle: Arc::new(AtomicUsize::new(0)),
+        retried_ranges: Arc::new(AtomicUsize::new(0)),
+        first_retry_started_ms: Arc::new(AtomicU64::new(0)),
+        throttle_closed_ms: Arc::new(AtomicU64::new(0)),
+        attempts: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let server_counters = counters.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(32) {
+            let stream = stream.unwrap();
+            let page_body = Arc::clone(&page_body);
+            let file_body = Arc::clone(&file_body);
+            let counters = server_counters.clone();
+            std::thread::spawn(move || {
+                handle_adaptive_retry_stream(stream, page_body, file_body, counters);
+            });
+        }
+    });
+    (format!("http://{addr}"), counters)
+}
+
+fn handle_adaptive_retry_stream(
+    mut stream: std::net::TcpStream,
+    page_body: Arc<Vec<u8>>,
+    file_body: Arc<Vec<u8>>,
+    counters: AdaptiveRetryCounters,
+) {
+    let mut request = [0_u8; 4096];
+    let read = stream.read(&mut request).unwrap();
+    let request = String::from_utf8_lossy(&request[..read]);
+    if request.starts_with(&format!("GET /{FILE_ID} ")) {
+        write_response(
+            &mut stream,
+            "text/html",
+            page_body.len(),
+            page_body.as_slice(),
+        );
+        return;
+    }
+
+    let Some((start, end)) = raw_range_header(&request) else {
+        write_status_response(&mut stream, "500 Internal Server Error");
+        return;
+    };
+    let ordinal = counters.total_ranges.fetch_add(1, Ordering::SeqCst) + 1;
+    let is_retry = {
+        let mut attempts = counters.attempts.lock().unwrap();
+        let attempts = attempts.entry((start, end)).or_default();
+        let is_retry = *attempts > 0;
+        *attempts += 1;
+        is_retry
+    };
+    if is_retry {
+        counters.retried_ranges.fetch_add(1, Ordering::SeqCst);
+        let started_ms = elapsed_millis(&counters);
+        counters
+            .first_retry_started_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(if current == 0 {
+                    started_ms
+                } else {
+                    current.min(started_ms)
+                })
+            })
+            .unwrap();
+    }
+
+    let inflight = counters.inflight_ranges.fetch_add(1, Ordering::SeqCst) + 1;
+    if ordinal > 4 && counters.throttle_closed_ms.load(Ordering::SeqCst) == 0 {
+        counters
+            .max_inflight_during_throttle
+            .fetch_max(inflight, Ordering::SeqCst);
+    }
+
+    if matches!(ordinal, 3 | 4) {
+        std::thread::sleep(Duration::from_millis(25));
+        write_status_response(&mut stream, "503 Service Unavailable");
+        counters.inflight_ranges.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+
+    write_raw_range_headers(&mut stream, file_body.len(), start, end);
+    let delay = match ordinal {
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        5 => Duration::from_millis(2500),
+        _ => Duration::from_millis(75),
+    };
+    std::thread::sleep(delay);
+    if ordinal == 2 {
+        counters
+            .throttle_closed_ms
+            .store(elapsed_millis(&counters), Ordering::SeqCst);
+    }
+    stream
+        .write_all(&file_body[start as usize..=end as usize])
+        .unwrap();
+    stream.flush().unwrap();
+    counters.inflight_ranges.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn elapsed_millis(counters: &AdaptiveRetryCounters) -> u64 {
+    counters.started_at.elapsed().as_millis() as u64 + 1
+}
+
 fn raw_range_header(request: &str) -> Option<(u64, u64)> {
     request.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
@@ -1971,16 +2508,26 @@ fn write_status_response(stream: &mut std::net::TcpStream, status: &str) {
 }
 
 fn write_raw_range_response(stream: &mut std::net::TcpStream, body: &[u8], start: u64, end: u64) {
-    let start = start as usize;
-    let end = end as usize;
+    write_raw_range_headers(stream, body.len(), start, end);
+    stream
+        .write_all(&body[start as usize..=end as usize])
+        .unwrap();
+    stream.flush().unwrap();
+}
+
+fn write_raw_range_headers(
+    stream: &mut std::net::TcpStream,
+    total_len: usize,
+    start: u64,
+    end: u64,
+) {
     write!(
         stream,
         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-        body.len(),
+        total_len,
         end - start + 1
     )
     .unwrap();
-    stream.write_all(&body[start..=end]).unwrap();
     stream.flush().unwrap();
 }
 

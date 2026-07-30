@@ -7,7 +7,7 @@ use std::{
 
 use indicatif::HumanBytes;
 
-use crate::download;
+use crate::{download, naming::escape_terminal_text};
 
 /// The transfer whose partial state should be reported when the process is
 /// interrupted with Ctrl-C. Updated by the download path as transfers start
@@ -48,7 +48,7 @@ pub fn spawn_ctrl_c_reporter() {
                     // than guessing, but still point at the kept .part.
                     None => format!(
                         "Interrupted.\nPartial download kept: {}\nRe-run the same command to resume.",
-                        active.part_path.display()
+                        escape_terminal_text(&active.part_path.to_string_lossy())
                     ),
                 }
             }
@@ -76,7 +76,7 @@ fn format_interrupt_summary(downloaded: u64, expected: Option<u64>, part_path: &
     };
     format!(
         "{first_line}\nPartial download kept: {}\nRe-run the same command to resume.",
-        part_path.display()
+        escape_terminal_text(&part_path.to_string_lossy())
     )
 }
 

@@ -11,6 +11,7 @@ Arguments:
 
 Options:
       --delkey <KEY>             Upload delete key
+      --delkey-file <PATH>       Read the upload delete key from a file
       --yes                      Skip the interactive confirmation prompt
       --timeout <TIMEOUT>        Per-request timeout in seconds
       --retries <RETRIES>        Retry count for retryable network/server failures

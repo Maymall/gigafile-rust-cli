@@ -36,7 +36,8 @@ pub async fn delete(options: DeleteOptions) -> Result<DeleteReport, GfileError> 
     validate_delkey(&options.delkey)?;
     let info = parse_download_url(&options.url, options.allow_any_host)?;
     let remove_url = remove_url(&info, &options.delkey)?;
-    let client = http::build_client(options.user_agent.as_deref())?;
+    let client =
+        http::build_gigafile_client(options.user_agent.as_deref(), options.allow_any_host)?;
     let response = http::get_with_retries_and_timeout(
         &client,
         &remove_url,
@@ -45,14 +46,19 @@ pub async fn delete(options: DeleteOptions) -> Result<DeleteReport, GfileError> 
         Some(options.timeout),
     )
     .await?;
-    let parsed =
-        response
-            .json::<DeleteResponse>()
-            .await
-            .map_err(|source| GfileError::DeleteRejected {
-                detail: format!("delete endpoint did not return valid JSON: {source}"),
-                status: None,
-            })?;
+    let body = http::read_body_limited(
+        response,
+        http::API_BODY_LIMIT,
+        options.timeout,
+        "reading delete response body",
+    )
+    .await?;
+    let parsed = serde_json::from_slice::<DeleteResponse>(&body).map_err(|source| {
+        GfileError::DeleteRejected {
+            detail: format!("delete endpoint did not return valid JSON: {source}"),
+            status: None,
+        }
+    })?;
     debug!(status = ?parsed.status, "delete endpoint response");
 
     match parsed.status {

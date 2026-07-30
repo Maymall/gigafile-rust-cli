@@ -12,6 +12,7 @@ Arguments:
 Options:
       --older-than <DAYS>  Only clean groups older than this many days
       --yes                Skip the interactive confirmation prompt
+      --json               Print one JSON object
   -h, --help               Print help
 
 Global Options:

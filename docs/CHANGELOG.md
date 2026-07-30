@@ -7,9 +7,65 @@ Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Add bounded response readers, retry handling for rate limits, strict URL and
+  upload-origin validation, and JSON envelopes for runtime and early CLI errors.
+- Add `delete --delkey-file`, JSON output for `parts clean`, streamed history
+  tailing, cross-process history coordination, and non-UTF-8 partial-file
+  discovery.
+- Add release/CI quality gates for Rust 1.88, three host operating systems,
+  dependency auditing, locked builds, and complete release-asset verification.
+- Add reproducible loopback upload, partial-file discovery, and HTML parser
+  benchmarks with recorded baselines, dispersion, memory, syscall, and hardware
+  counter results.
+
+### Fixed
+
+- Harden resumable sidecars with atomic durable checkpoints, exact segmented
+  coverage checks, key-state validation, and race-free target promotion.
+- Bound upload read-ahead memory and fall back to streaming for chunks too large
+  for the configured budget; reject non-successful chunk status responses.
+- Make config writes atomic, coordinate complete history records across
+  processes, restrict both to the owner on Unix, and use Windows replacement
+  semantics for metadata and completed downloads.
+- Bound each history JSONL record to 1 MiB, omit stored delete keys from history
+  JSON output, and keep explicit delete credentials usable when history is
+  corrupt.
+- Preserve Clap help/version output and success codes when `--json` is present,
+  and atomically replace installer-managed binaries from same-directory staging
+  files so a failed install leaves the previous executable intact.
+- Escape terminal control characters in human output and sanitize installer
+  checksum parsing; use standard SemVer ordering for self-update decisions.
+- Refuse symlink and hard-link attacks against partial downloads and history
+  state, preserve late-created download targets, and prevent colliding matomete
+  entries from overwriting one another even with `--force`.
+- Keep delayed segment retries outside the active-connection limit, enforce a
+  reduced concurrency limit immediately after throttling, and treat failures
+  after a completed download has been atomically promoted as cleanup warnings.
+- Verify uploads only from an exact one-byte `206 Content-Range` response;
+  equal-length HTML pages and ambiguous `200` responses can no longer produce a
+  false successful verification.
+- Require self-update and installer staging binaries to report the exact
+  expected version, bound archive and subprocess output, reject duplicate or
+  linked archive members, and replace the live executable without a Windows
+  crash gap.
+- Stream history delete-key lookup with bounded memory, cap delete-key files,
+  and reject oversized or invalid UTF-8 credential files.
+
 ### Changed
 
 - Consolidate duplicated error-construction helpers (`io_error`, `network_error`, `boxed`, `usage`, internal-state errors) into `error.rs`.
+- Raise the MSRV to Rust 1.88 and update the release profile and supported
+  installer architecture matrix documentation.
+- Remove upload hot-path mutexes, repeated seeks, per-block allocations and
+  copies; overlap bounded positional read-ahead with the active upload while
+  avoiding progress locks when no bars are rendered.
+- Reuse parsed selectors, regular expressions, DOMs, metadata samples, and
+  sidecar reads in partial-file discovery and download-page parsing.
+- Pin third-party GitHub Actions to audited commits and make published releases
+  immutable; reruns verify their exact metadata and asset set, while matching
+  unpublished drafts can recover from a partial asset upload.
 
 ## [0.10.1] - 2026-07-04
 

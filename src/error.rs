@@ -9,6 +9,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::naming::escape_terminal_text;
+
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 pub(crate) fn boxed(error: impl Error + Send + Sync + 'static) -> BoxError {
@@ -63,6 +65,9 @@ pub enum GfileError {
 
     #[error("unexpected HTTP status {status}")]
     HttpStatus { status: u16, url_redacted: String },
+
+    #[error("{context} exceeded the {limit}-byte response limit")]
+    ResponseTooLarge { context: String, limit: u64 },
 
     #[error("page parse failed: {what}")]
     Parse { what: String, hint: String },
@@ -139,6 +144,7 @@ impl GfileError {
             Self::InvalidUrl { .. } => 10,
             Self::Network { .. } => 11,
             Self::HttpStatus { .. } => 12,
+            Self::ResponseTooLarge { .. } => 12,
             Self::Parse { .. } => 13,
             Self::NotFoundOrExpired => 14,
             Self::KeyRequired => 15,
@@ -160,6 +166,7 @@ impl GfileError {
             Self::InvalidUrl { .. } => "invalid_url",
             Self::Network { .. } => "network",
             Self::HttpStatus { .. } => "http_status",
+            Self::ResponseTooLarge { .. } => "response_too_large",
             Self::Parse { .. } => "parse",
             Self::NotFoundOrExpired => "not_found_or_expired",
             Self::KeyRequired => "key_required",
@@ -190,6 +197,10 @@ impl GfileError {
             Self::HttpStatus { status, .. } => format!(
                 "The server returned unexpected HTTP status {status}. Try again later or rerun with -vv for diagnostics."
             ),
+            Self::ResponseTooLarge { context, limit } => format!(
+                "The server response while {} exceeded the safety limit of {limit} bytes. Retry later; if it persists, rerun with -vv and report the endpoint.",
+                sanitize_message(context)
+            ),
             Self::Parse { what, hint } => format!(
                 "The page could not be parsed: {}. {}",
                 sanitize_message(what),
@@ -214,14 +225,14 @@ impl GfileError {
                 "The downloaded size did not match the server header: expected {expected} bytes, got {actual} bytes. Keep the .part file for diagnostics or retry the download."
             ),
             Self::Io { source, path, op } => io_message(source, path, *op),
-            Self::TargetLocked { path } => format!(
+            Self::TargetLocked { path } => sanitize_message(&format!(
                 "Another rgfile process appears to be downloading this file. Wait for it to finish, or remove the lock file if that process crashed: {}",
                 path.display()
-            ),
-            Self::TargetExists { path } => format!(
+            )),
+            Self::TargetExists { path } => sanitize_message(&format!(
                 "The download target already exists: {}. Pass --force to overwrite it, or move the existing file away.",
                 path.display()
-            ),
+            )),
             Self::DeleteRejected { detail, status } => {
                 let status = status
                     .map(|status| format!(" (delete status {status})"))
@@ -248,28 +259,28 @@ impl GfileError {
 fn io_message(source: &io::Error, path: &std::path::Path, op: IoOp) -> String {
     if source.kind() == ErrorKind::PermissionDenied {
         if let Some(hint) = install_hint(path) {
-            return format!(
+            return sanitize_message(&format!(
                 "Permission was denied while trying to {op} {}. {hint}",
                 path.display()
-            );
+            ));
         }
-        return format!(
+        return sanitize_message(&format!(
             "Permission was denied while trying to {op} {}. Check the directory permissions and choose a writable destination.",
             path.display()
-        );
+        ));
     }
 
     if matches!(source.raw_os_error(), Some(28) | Some(112)) {
-        return format!(
+        return sanitize_message(&format!(
             "The disk appears to be full while trying to {op} {}. Free space or choose another destination and retry.",
             path.display()
-        );
+        ));
     }
 
-    format!(
+    sanitize_message(&format!(
         "A local I/O error occurred while trying to {op} {}: {source}. Check the path and retry.",
         path.display()
-    )
+    ))
 }
 
 fn install_hint(path: &std::path::Path) -> Option<&'static str> {
@@ -294,7 +305,7 @@ fn sanitize_message(value: &str) -> String {
     redact_assignment(&mut output, "delete_key=", "redacted-delete-key");
     redact_json_string_field(&mut output, "delkey");
     redact_json_string_field(&mut output, "delete_key");
-    output
+    escape_terminal_text(&output).into_owned()
 }
 
 fn redact_assignment(output: &mut String, marker: &str, replacement: &str) {
@@ -388,6 +399,21 @@ mod tests {
         assert!(message.contains("redacted-delete-key"), "{message}");
     }
 
+    #[test]
+    fn user_message_escapes_terminal_controls() {
+        let usage = GfileError::Usage {
+            message: "bad\n\x1b[31mvalue".to_owned(),
+        };
+        let message = usage.user_message();
+        assert_eq!(message, r"bad\n\u{1b}[31mvalue");
+        assert!(!message.chars().any(char::is_control));
+
+        let target = GfileError::TargetExists {
+            path: std::path::PathBuf::from("target\n\x1b[2J"),
+        };
+        assert!(!target.user_message().chars().any(char::is_control));
+    }
+
     fn error_cases() -> Vec<(GfileError, u8)> {
         vec![
             (
@@ -416,6 +442,13 @@ mod tests {
                     status: 503,
                     url_redacted: "download.php?file=0123abcd-000000example&dlkey=EXAMPLE-KEY-0000"
                         .to_owned(),
+                },
+                12,
+            ),
+            (
+                GfileError::ResponseTooLarge {
+                    context: "reading a control response".to_owned(),
+                    limit: 1024,
                 },
                 12,
             ),

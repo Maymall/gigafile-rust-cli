@@ -12,28 +12,33 @@ English | [简体中文](docs/README.zh.md) | [日本語](docs/README.ja.md)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Maymall/gigafile-rust-cli/main/install.sh | sh   # Linux / macOS
-cargo install rgfile                                                                          # Rust 1.85+
+cargo install rgfile                                                                          # Rust 1.88+
 brew install Maymall/tap/rgfile                                                               # Homebrew
 ```
 
 Windows: `irm https://raw.githubusercontent.com/Maymall/gigafile-rust-cli/main/install.ps1 | iex`
 
-Prebuilt archives and a Debian package are on the
-[releases page](https://github.com/Maymall/gigafile-rust-cli/releases/latest).
+The one-line installers verify the selected archive against the release's
+`SHA256SUMS` before extracting it. `install.sh` supports Linux x86_64 (static
+musl) and macOS x86_64/arm64; `install.ps1` supports Windows x86_64. The
+[releases page](https://github.com/Maymall/gigafile-rust-cli/releases/latest)
+also provides a Linux x86_64 glibc archive and an x86_64 Debian package. Other
+architectures can build from source.
 Release-installed binaries upgrade themselves with `rgfile self-update`.
 
 ## Usage
 
 ```bash
 rgfile ul file.bin                   # upload; prints the URL, delete key, expiry
-rgfile ul file.bin --lifetime 7      # keep for 7 days (3–100)
+rgfile ul file.bin --lifetime 7      # keep for 7 days (3, 5, 7, 14, 30, 60, or 100)
 
 rgfile dl <url>                      # download; interrupted transfers resume
 rgfile dl <url> --threads 8          # segmented download over several connections
 rgfile dl <url> --select 1,3-5       # pick files from a multi-file page
 
 rgfile info <url>                    # inspect a page without downloading
-rgfile delete <url>                  # take an upload down, using its delete key
+rgfile delete <url>                  # prompt privately for the delete key on a TTY
+rgfile delete <url> --delkey-file key.txt --yes
 rgfile parts list                    # leftover partial downloads
 rgfile parts clean --older-than 7    # drop stale ones; active downloads are never touched
 
@@ -42,7 +47,9 @@ rgfile history list                  # local history (opt-in)
 rgfile completions zsh               # shell completions
 ```
 
-Every command takes `--json`. `rgfile <command> --help` has the rest.
+Transfer, inspection, history-list, parts-list/clean, config-show, and delete
+commands accept `--json`; destructive JSON commands also require `--yes`.
+`rgfile <command> --help` has the complete option list.
 
 ## Configuration
 
@@ -58,6 +65,11 @@ threads = 8                    # connections per file, 1–16
 [upload]
 lifetime = 7                   # days: 3/5/7/14/30/60/100
 threads = 4                    # read-ahead chunk window, 1–16
+
+[network]
+timeout = 60                   # idle seconds per request/read, 1–86400
+retries = 3                    # retryable failures, 0–20
+# user_agent = "rgfile/0.10.1"
 
 [history]
 enabled = true                 # off by default
@@ -75,6 +87,8 @@ store_delete_keys = false      # plaintext, opt-in
   download passwords never appear in logs.
 - Uploads stream with per-chunk retry; chunk completion stays ordered because
   the server drops out-of-order chunks (verified against the live service).
+- Upload read-ahead is bounded to roughly 512 MiB; a large chunk size can reduce
+  the effective window below `--threads` to keep memory predictable.
 - rgfile does not bypass GigaFile restrictions, guess passwords, or scrape links.
 
 ## Exit codes
@@ -85,7 +99,7 @@ store_delete_keys = false      # plaintext, opt-in
 | 2 | Invalid arguments |
 | 10 | Not a GigaFile URL |
 | 11 | Network failure, retries exhausted |
-| 12 | Unexpected HTTP status |
+| 12 | Unexpected HTTP status or oversized control response |
 | 13 | Page could not be parsed |
 | 14 | Not found or expired |
 | 15 / 16 | Download key required / rejected |
@@ -98,6 +112,12 @@ store_delete_keys = false      # plaintext, opt-in
 | 130 | Interrupted; the kept `.part` resumes on re-run |
 
 Changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
+
+History is disabled by default. When enabled, records are stored as JSONL in
+the platform data directory (`~/.local/share/rgfile/` on Linux). Delete keys
+are never stored unless `history.store_delete_keys = true`; that opt-in keeps
+them locally in plaintext and should be treated like a credential.
+`history list --json` never prints stored delete keys.
 
 ## License
 

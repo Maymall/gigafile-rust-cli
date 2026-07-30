@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-use regex::Regex;
 use reqwest::Url;
 
 use crate::error::GfileError;
 
 // gfile.py@4c45392 line 239 accepts `https?://<digits>.gigafile.nu/<id>`.
 // The Rust CLI follows the project spec/test plan and requires HTTPS in normal mode.
-const NORMAL_HOST_RE: &str = r"^[0-9]+\.gigafile\.nu$";
-const FILE_ID_RE: &str = r"^[A-Za-z0-9][A-Za-z0-9-]*$";
 // gfile.py@4c45392 line 286 constructs downloads as `<page-origin>/download.php?file=<id>`.
 const DOWNLOAD_ENDPOINT_WITH_FILE_PARAM: &str = "/download.php?file=";
 
@@ -53,10 +50,12 @@ pub fn parse_download_url(input: &str, allow_any_host: bool) -> Result<UrlInfo, 
     if url.query().is_some() || url.fragment().is_some() {
         return Err(invalid(input));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid(input));
+    }
 
     let file_id = single_path_segment(&url).ok_or_else(|| invalid(input))?;
-    let file_id_re = Regex::new(FILE_ID_RE).expect("valid file id regex");
-    if !file_id_re.is_match(file_id) {
+    if !valid_file_id(file_id) {
         return Err(invalid(input));
     }
 
@@ -66,16 +65,34 @@ pub fn parse_download_url(input: &str, allow_any_host: bool) -> Result<UrlInfo, 
             return Err(invalid(input));
         }
     } else {
-        let host_re = Regex::new(NORMAL_HOST_RE).expect("valid host regex");
-        if url.scheme() != "https" || !host_re.is_match(host) {
+        if url.scheme() != "https"
+            || !numeric_gigafile_host(host)
+            || url.port().is_some_and(|port| port != 443)
+        {
             return Err(invalid(input));
         }
     }
 
     Ok(UrlInfo {
         page_url: url.as_str().to_owned(),
-        origin: origin(&url, host),
+        origin: url.origin().ascii_serialization(),
         file_id: file_id.to_owned(),
+    })
+}
+
+fn valid_file_id(file_id: &str) -> bool {
+    file_id
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && file_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn numeric_gigafile_host(host: &str) -> bool {
+    host.strip_suffix(".gigafile.nu").is_some_and(|prefix| {
+        !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())
     })
 }
 
@@ -92,13 +109,6 @@ fn single_path_segment(url: &Url) -> Option<&str> {
         return None;
     }
     Some(first)
-}
-
-fn origin(url: &Url, host: &str) -> String {
-    match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-        None => format!("{}://{}", url.scheme(), host),
-    }
 }
 
 #[cfg(test)]
@@ -131,6 +141,8 @@ mod tests {
             "https://23.gigafile.nu/",
             "https://23.gigafile.nu/0123abcd-000000example?x=1",
             "https://23.gigafile.nu/0123abcd-000000example#frag",
+            "https://user:secret@23.gigafile.nu/0123abcd-000000example",
+            "https://23.gigafile.nu:444/0123abcd-000000example",
             "https://23.gigafile.nu/-bad",
             "not a url",
         ] {
@@ -144,5 +156,27 @@ mod tests {
 
         assert_eq!(info.origin, "http://127.0.0.1:8080");
         assert_eq!(info.file_id, "abc");
+    }
+
+    #[test]
+    fn parse_download_url_preserves_bracketed_ipv6_origin_with_port() {
+        let info = parse_download_url("http://[::1]:8080/abc", true).unwrap();
+
+        assert_eq!(info.origin, "http://[::1]:8080");
+        assert_eq!(
+            info.download_url(),
+            "http://[::1]:8080/download.php?file=abc"
+        );
+    }
+
+    #[test]
+    fn parse_download_url_preserves_bracketed_ipv6_origin_without_port() {
+        let info = parse_download_url("https://[2001:db8::1]/abc", true).unwrap();
+
+        assert_eq!(info.origin, "https://[2001:db8::1]");
+        assert_eq!(
+            info.download_url_for("abc-2", Some("KEY")),
+            "https://[2001:db8::1]/download.php?file=abc-2&dlkey=KEY"
+        );
     }
 }

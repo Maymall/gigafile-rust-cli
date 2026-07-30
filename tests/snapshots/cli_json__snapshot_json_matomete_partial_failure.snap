@@ -26,5 +26,5 @@ expression: normalize_json(&output.stdout)
     }
   ],
   "kind": "matomete",
-  "status": "ok"
+  "status": "partial"
 }

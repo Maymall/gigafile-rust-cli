@@ -2,20 +2,30 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use rgfile::cli::{self, Cli, RunOutcome};
 
 fn main() -> ExitCode {
     restore_sigpipe_default();
 
+    let json_requested = std::env::args_os().any(|arg| arg == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
             let code = err.exit_code();
-            let _ = err.print();
+            let is_display = matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            );
+            if json_requested && !is_display {
+                let _ = rgfile::jsonout::print_usage_error(err.to_string());
+            } else {
+                let _ = err.print();
+            }
             return exit_code(code);
         }
     };
+    let json_output = cli.wants_json();
 
     cli::init_tracing(cli.verbose);
 
@@ -34,7 +44,11 @@ fn main() -> ExitCode {
         Ok(RunOutcome::Success) => ExitCode::SUCCESS,
         Ok(RunOutcome::Failure(code)) => exit_code(i32::from(code)),
         Err(err) => {
-            eprintln!("{}", err.user_message());
+            if json_output {
+                let _ = rgfile::jsonout::print_error(&err);
+            } else {
+                eprintln!("{}", err.user_message());
+            }
             exit_code(i32::from(err.exit_code()))
         }
     }

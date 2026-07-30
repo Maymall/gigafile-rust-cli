@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    fs,
-    io::{self, BufRead, Write},
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{self, BufRead, Read as _, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use directories::BaseDirs;
 use serde::Deserialize;
@@ -12,12 +16,17 @@ use serde::Deserialize;
 use crate::{
     download,
     error::{GfileError, IoOp, io_error},
+    fsutil, http,
+    naming::escape_terminal_text,
     upload,
 };
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_RETRIES: u32 = 3;
 pub const DEFAULT_UPLOAD_LIFETIME: u16 = 100;
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+pub const MAX_RETRIES: u32 = 20;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -101,16 +110,20 @@ impl AppConfig {
         )
     }
 
-    pub fn resolve_timeout_secs(&self, cli_timeout: Option<u64>) -> u64 {
-        cli_timeout
+    pub fn resolve_timeout_secs(&self, cli_timeout: Option<u64>) -> Result<u64, GfileError> {
+        let timeout = cli_timeout
             .or(self.network.timeout)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        validate_timeout(timeout)?;
+        Ok(timeout)
     }
 
-    pub fn resolve_retries(&self, cli_retries: Option<u32>) -> u32 {
-        cli_retries
+    pub fn resolve_retries(&self, cli_retries: Option<u32>) -> Result<u32, GfileError> {
+        let retries = cli_retries
             .or(self.network.retries)
-            .unwrap_or(DEFAULT_RETRIES)
+            .unwrap_or(DEFAULT_RETRIES);
+        validate_retries(retries)?;
+        Ok(retries)
     }
 
     pub fn resolve_user_agent(&self, cli_user_agent: Option<String>) -> Option<String> {
@@ -137,6 +150,7 @@ pub fn load(options: LoadOptions<'_>) -> Result<AppConfig, GfileError> {
         return Ok(AppConfig::default());
     }
 
+    let explicit_path = options.path.is_some();
     let Some(path) = options
         .path
         .map(Path::to_owned)
@@ -145,10 +159,18 @@ pub fn load(options: LoadOptions<'_>) -> Result<AppConfig, GfileError> {
         return Ok(AppConfig::default());
     };
 
-    let text = match fs::read_to_string(&path) {
+    let text = match read_config_text(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !explicit_path => {
             return Ok(AppConfig::default());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(GfileError::Usage {
+                message: format!(
+                    "explicit config file does not exist: {}; fix --config or remove the option",
+                    path.display()
+                ),
+            });
         }
         Err(source) => return Err(io_error(source, &path, IoOp::Read)),
     };
@@ -179,7 +201,7 @@ pub fn inspect(options: LoadOptions<'_>) -> Result<ConfigInspection, GfileError>
         });
     };
 
-    let text = match fs::read_to_string(&path) {
+    let text = match read_config_text(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ConfigInspection {
@@ -216,6 +238,96 @@ pub fn default_config_path() -> Option<PathBuf> {
             .join("rgfile")
             .join("config.toml"),
     )
+}
+
+fn read_config_text(path: &Path) -> io::Result<String> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration file is too large or is not a regular file",
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration file exceeds the size limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
+}
+
+pub fn write_config_file(path: &Path, text: &str, overwrite: bool) -> Result<(), GfileError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| io_error(source, parent, IoOp::Create))?;
+
+    let file_name = path.file_name().ok_or_else(|| GfileError::Usage {
+        message: format!("config path must name a file: {}", path.display()),
+    })?;
+    let mut temp_name = OsString::from(file_name);
+    temp_name.push(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
+    let temp_path = path.with_file_name(temp_name);
+
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|source| io_error(source, &temp_path, IoOp::Create))?;
+        restrict_config_permissions(&file)
+            .map_err(|source| io_error(source, &temp_path, IoOp::Write))?;
+        file.write_all(text.as_bytes())
+            .map_err(|source| io_error(source, &temp_path, IoOp::Write))?;
+        file.sync_all()
+            .map_err(|source| io_error(source, &temp_path, IoOp::Write))?;
+        drop(file);
+
+        install_config_file(&temp_path, path, overwrite)
+            .map_err(|source| io_error(source, path, IoOp::Write))?;
+        sync_config_parent(parent).map_err(|source| io_error(source, parent, IoOp::Write))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn install_config_file(temp_path: &Path, path: &Path, overwrite: bool) -> io::Result<()> {
+    if overwrite {
+        return fsutil::replace_file(temp_path, path);
+    }
+
+    fsutil::move_file_noreplace(temp_path, path)
+}
+
+#[cfg(unix)]
+fn restrict_config_permissions(file: &fs::File) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_config_permissions(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_config_parent(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_config_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 impl ConfigInspection {
@@ -330,7 +442,10 @@ pub fn confirm_overwrite(
     prompt_bool(
         reader,
         writer,
-        &format!("Config file {} already exists. Overwrite?", path.display()),
+        &format!(
+            "Config file {} already exists. Overwrite?",
+            escape_terminal_text(&path.to_string_lossy())
+        ),
         false,
     )
 }
@@ -601,7 +716,36 @@ fn validate(config: &AppConfig) -> Result<(), GfileError> {
     if let Some(threads) = config.download.threads {
         download::validate_threads(threads)?;
     }
+    if let Some(timeout) = config.network.timeout {
+        validate_timeout(timeout)?;
+    }
+    if let Some(retries) = config.network.retries {
+        validate_retries(retries)?;
+    }
+    if let Some(user_agent) = config.network.user_agent.as_deref() {
+        http::validate_user_agent(user_agent)?;
+    }
     Ok(())
+}
+
+fn validate_timeout(timeout: u64) -> Result<(), GfileError> {
+    if (1..=MAX_TIMEOUT_SECS).contains(&timeout) {
+        Ok(())
+    } else {
+        Err(GfileError::Usage {
+            message: format!("network timeout must be between 1 and {MAX_TIMEOUT_SECS} seconds"),
+        })
+    }
+}
+
+fn validate_retries(retries: u32) -> Result<(), GfileError> {
+    if retries <= MAX_RETRIES {
+        Ok(())
+    } else {
+        Err(GfileError::Usage {
+            message: format!("network retries must be between 0 and {MAX_RETRIES}"),
+        })
+    }
 }
 
 fn parse_error(error: toml::de::Error, text: &str, path: &Path) -> GfileError {
@@ -631,25 +775,66 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn missing_config_uses_defaults() {
+    fn config_write_is_atomic_and_requires_explicit_overwrite() {
         let temp = tempfile::TempDir::new().unwrap();
-        let config = load(LoadOptions {
+        let path = temp.path().join("nested").join("config.toml");
+
+        write_config_file(&path, "first", false).unwrap();
+        let error = write_config_file(&path, "second", false).unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert!(matches!(error, GfileError::Io { .. }));
+
+        write_config_file(&path, "second", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_restricts_permissions_to_owner() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o666);
+        options.open(&path).unwrap();
+
+        write_config_file(&path, "[history]\nenabled = true\n", true).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn explicit_missing_config_is_an_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = load(LoadOptions {
             path: Some(&temp.path().join("missing.toml")),
             no_config: false,
         })
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.user_message().contains("does not exist"));
+    }
+
+    #[test]
+    fn no_config_uses_defaults() {
+        let config = load(LoadOptions {
+            path: None,
+            no_config: true,
+        })
         .unwrap();
 
-        assert_eq!(config.resolve_timeout_secs(None), DEFAULT_TIMEOUT_SECS);
-        assert_eq!(config.resolve_retries(None), DEFAULT_RETRIES);
         assert_eq!(
-            config.resolve_download_threads(None).unwrap(),
-            download::DEFAULT_DOWNLOAD_THREADS
+            config.resolve_timeout_secs(None).unwrap(),
+            DEFAULT_TIMEOUT_SECS
         );
-        assert_eq!(
-            config.resolve_upload_threads(None).unwrap(),
-            upload::DEFAULT_UPLOAD_THREADS
-        );
-        assert_eq!(config.resolve_lifetime(None), DEFAULT_UPLOAD_LIFETIME);
+        assert_eq!(config.resolve_retries(None).unwrap(), DEFAULT_RETRIES);
     }
 
     #[test]
@@ -680,10 +865,10 @@ mod tests {
         assert_eq!(config.resolve_download_output(None), Some(output));
         assert_eq!(config.resolve_download_threads(Some(2)).unwrap(), 2);
         assert_eq!(config.resolve_download_threads(None).unwrap(), 3);
-        assert_eq!(config.resolve_timeout_secs(Some(8)), 8);
-        assert_eq!(config.resolve_timeout_secs(None), 9);
-        assert_eq!(config.resolve_retries(Some(4)), 4);
-        assert_eq!(config.resolve_retries(None), 1);
+        assert_eq!(config.resolve_timeout_secs(Some(8)).unwrap(), 8);
+        assert_eq!(config.resolve_timeout_secs(None).unwrap(), 9);
+        assert_eq!(config.resolve_retries(Some(4)).unwrap(), 4);
+        assert_eq!(config.resolve_retries(None).unwrap(), 1);
         assert_eq!(
             config.resolve_user_agent(Some("from-cli".to_owned())),
             Some("from-cli".to_owned())
@@ -742,6 +927,18 @@ mod tests {
                 .user_message()
                 .contains("upload threads must be between 1 and 16")
         );
+    }
+
+    #[test]
+    fn invalid_network_limits_are_usage_errors() {
+        for text in [
+            "[network]\ntimeout = 0\n",
+            "[network]\ntimeout = 86401\n",
+            "[network]\nretries = 21\n",
+        ] {
+            let error = parse_text(text, Path::new("config.toml")).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 
     #[test]

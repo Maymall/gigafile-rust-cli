@@ -168,6 +168,93 @@ async fn snapshot_json_single_success() {
     insta::assert_snapshot!(normalize_json(&output.stdout));
 }
 
+#[test]
+fn json_wraps_early_argument_errors() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args([
+            "--no-config",
+            "download",
+            "--json",
+            "--select",
+            "not-a-selection",
+            "https://23.gigafile.nu/0123abcd-000000example",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["code"], "usage");
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1
+    );
+}
+
+#[test]
+fn json_wraps_explicit_missing_config_errors() {
+    let temp = TempDir::new().unwrap();
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--config"])
+        .arg(temp.path().join("missing.toml"))
+        .args([
+            "info",
+            "--json",
+            "https://23.gigafile.nu/0123abcd-000000example",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["code"], "usage");
+}
+
+#[test]
+fn json_help_keeps_clap_display_help_semantics() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "download", "--json", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Download a file"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\"status\":\"error\""));
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn json_version_keeps_clap_display_version_semantics() {
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--version", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("rgfile "));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\"status\":\"error\""));
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn parts_clean_json_reports_success() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("stale.bin.part"), b"partial").unwrap();
+    let output = Command::cargo_bin("rgfile")
+        .unwrap()
+        .args(["--no-config", "parts", "clean", "--yes", "--json"])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["deleted"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn snapshot_json_matomete_partial_failure() {
     let server = MockServer::start().await;

@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{header, method, path, query_param},
 };
 
 const FILE_ID: &str = "0123abcd-000000example";
@@ -122,7 +122,7 @@ async fn upload_sends_chunks_serially_from_zero() {
 }
 
 #[tokio::test]
-async fn upload_threads_prefetches_but_completes_chunks_in_order() {
+async fn upload_stops_if_source_changes_after_prefetch() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     let order = Arc::new(AtomicUsize::new(0));
@@ -137,11 +137,10 @@ async fn upload_threads_prefetches_but_completes_chunks_in_order() {
                 .parse::<usize>()
                 .unwrap();
             assert_eq!(chunk, expected);
-            if chunk == 0 {
-                if let Some(sender) = first_seen_tx.lock().unwrap().take() {
+            if chunk == 0
+                && let Some(sender) = first_seen_tx.lock().unwrap().take() {
                     let _ = sender.send(());
                 }
-            }
             let response = ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({ "status": 0, "url": format!("http://example.invalid/{FILE_ID}") }));
             if chunk == 0 {
@@ -170,14 +169,15 @@ async fn upload_threads_prefetches_but_completes_chunks_in_order() {
     rewritten.extend(b"tail");
     std::fs::write(&file, rewritten).unwrap();
 
-    let report = upload_task.await.unwrap().unwrap();
+    let error = upload_task
+        .await
+        .unwrap()
+        .expect_err("changing the upload source must stop the upload");
 
-    assert_eq!(report.bytes, body.len() as u64);
-    assert_eq!(order.load(Ordering::SeqCst), 3);
+    assert!(matches!(error, GfileError::UploadRejected { .. }));
+    assert_eq!(order.load(Ordering::SeqCst), 1);
     let requests = upload_requests(&server).await;
-    assert_eq!(requests.len(), 3);
-    assert!(body_contains(&requests[1].body, &[b'b'; 128]));
-    assert!(!body_contains(&requests[1].body, &[b'z'; 128]));
+    assert_eq!(requests.len(), 1);
 }
 
 #[tokio::test]
@@ -241,7 +241,34 @@ async fn upload_missing_final_url_is_upload_rejected() {
 }
 
 #[tokio::test]
-async fn upload_retries_5xx_then_succeeds() {
+async fn upload_nonzero_json_status_stops_before_later_chunks() {
+    let server = MockServer::start().await;
+    mount_landing(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/upload_chunk.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": 1,
+            "url": format!("http://example.invalid/{FILE_ID}")
+        })))
+        .mount(&server)
+        .await;
+    let temp = TempDir::new().unwrap();
+    let file = write_file(
+        &temp,
+        "status-failure.bin",
+        &vec![b'x'; MIN_CHUNK_SIZE as usize + 1],
+    );
+
+    let error = upload(options(&server, file, true, 3))
+        .await
+        .expect_err("nonzero upload status should fail");
+
+    assert!(matches!(error, GfileError::UploadRejected { .. }));
+    assert_eq!(upload_requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn upload_does_not_replay_chunk_after_5xx_response() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     let counter = Arc::new(AtomicUsize::new(0));
@@ -262,13 +289,16 @@ async fn upload_retries_5xx_then_succeeds() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "retry.bin", b"hello");
 
-    upload(options(&server, file, true, 2)).await.unwrap();
+    let error = upload(options(&server, file, true, 2))
+        .await
+        .expect_err("a completed request body must not be replayed after 5xx");
 
-    assert_eq!(counter.load(Ordering::SeqCst), 3);
+    assert!(matches!(error, GfileError::UploadRejected { .. }));
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn upload_idle_timeout_retries_stalled_response_then_succeeds() {
+async fn upload_does_not_replay_chunk_after_response_timeout() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     let counter = Arc::new(AtomicUsize::new(0));
@@ -290,9 +320,12 @@ async fn upload_idle_timeout_retries_stalled_response_then_succeeds() {
     let temp = TempDir::new().unwrap();
     let file = write_file(&temp, "idle-timeout.bin", b"hello");
 
-    upload(options(&server, file, true, 1)).await.unwrap();
+    let error = upload(options(&server, file, true, 1))
+        .await
+        .expect_err("a completed request body must not be replayed after response timeout");
 
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert!(matches!(error, GfileError::Network { .. }));
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -316,15 +349,21 @@ async fn upload_does_not_retry_4xx_or_continue_later_chunks() {
 }
 
 #[tokio::test]
-async fn upload_verify_success_uses_head_content_length() {
+async fn upload_verify_success_uses_strict_range_total() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     mount_upload_success(&server, format!("{}/{FILE_ID}", server.uri())).await;
     mount_download_page(&server).await;
-    Mock::given(method("HEAD"))
+    Mock::given(method("GET"))
         .and(path("/download.php"))
         .and(query_param("file", FILE_ID))
-        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "5"))
+        .and(header("Range", "bytes=0-0"))
+        .and(header("Accept-Encoding", "identity"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 0-0/5")
+                .set_body_bytes(b"h"),
+        )
         .mount(&server)
         .await;
     let temp = TempDir::new().unwrap();
@@ -341,10 +380,15 @@ async fn upload_verify_failure_returns_verify_failed() {
     mount_landing(&server).await;
     mount_upload_success(&server, format!("{}/{FILE_ID}", server.uri())).await;
     mount_download_page(&server).await;
-    Mock::given(method("HEAD"))
+    Mock::given(method("GET"))
         .and(path("/download.php"))
         .and(query_param("file", FILE_ID))
-        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "9"))
+        .and(header("Range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 0-0/9")
+                .set_body_bytes(b"h"),
+        )
         .mount(&server)
         .await;
     let temp = TempDir::new().unwrap();
@@ -364,8 +408,8 @@ async fn upload_verify_failure_returns_verify_failed() {
 }
 
 #[tokio::test]
-async fn upload_verify_falls_back_to_get_headers_without_reading_body() {
-    let raw_url = start_head_fallback_server();
+async fn upload_verify_reads_range_headers_without_waiting_for_body() {
+    let raw_url = start_range_probe_server();
     let server = MockServer::start().await;
     mount_landing(&server).await;
     mount_upload_success(&server, format!("{raw_url}/{FILE_ID}")).await;
@@ -378,26 +422,25 @@ async fn upload_verify_falls_back_to_get_headers_without_reading_body() {
     assert_eq!(report.verified, Some(true));
     assert!(
         start.elapsed() < Duration::from_secs(2),
-        "GET fallback consumed or waited for the response body"
+        "range verification consumed or waited for the response body"
     );
 }
 
 #[tokio::test]
-async fn upload_verify_unavailable_reports_null_verified() {
+async fn upload_verify_rejects_equal_length_html_response() {
     let server = MockServer::start().await;
     mount_landing(&server).await;
     mount_upload_success(&server, format!("{}/{FILE_ID}", server.uri())).await;
     mount_download_page(&server).await;
-    Mock::given(method("HEAD"))
-        .and(path("/download.php"))
-        .and(query_param("file", FILE_ID))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/download.php"))
         .and(query_param("file", FILE_ID))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ignored".to_vec()))
+        .and(header("Range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_bytes(b"hello"),
+        )
         .mount(&server)
         .await;
     let temp = TempDir::new().unwrap();
@@ -509,11 +552,11 @@ fn upload_success_json(url: &str) -> serde_json::Value {
     serde_json::from_str(&text).unwrap()
 }
 
-fn start_head_fallback_server() -> String {
+fn start_range_probe_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
-        for stream in listener.incoming().take(3) {
+        for stream in listener.incoming().take(2) {
             let mut stream = stream.unwrap();
             let mut request = [0_u8; 4096];
             let read = stream.read(&mut request).unwrap();
@@ -521,12 +564,10 @@ fn start_head_fallback_server() -> String {
             if request.starts_with(&format!("GET /{FILE_ID} ")) {
                 let body = include_str!("fixtures/single_basic.html").as_bytes();
                 write_response(&mut stream, 200, "text/html", Some(body.len()), body);
-            } else if request.starts_with("HEAD /download.php") {
-                write_response(&mut stream, 405, "text/plain", Some(0), b"");
             } else if request.starts_with("GET /download.php") {
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-0/5\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
                 stream.flush().unwrap();

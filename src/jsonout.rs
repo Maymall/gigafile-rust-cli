@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-use std::path::Path;
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 
 use serde::Serialize;
 
 use crate::{
     download::{DownloadFileRecord, DownloadReport},
-    error::GfileError,
+    error::{GfileError, IoOp},
     info::{InfoFileRecord, InfoReport},
     parser::download::PageKind,
     upload::UploadReport,
@@ -40,7 +43,7 @@ pub struct ErrorJson {
 
 pub fn print_download_report(report: &DownloadReport) -> Result<(), GfileError> {
     let json = DownloadReportJson {
-        status: "ok",
+        status: if report.failed == 0 { "ok" } else { "partial" },
         kind: kind_name(report.kind),
         files: report.files.iter().map(download_file_json).collect(),
         failed: report.failed,
@@ -83,6 +86,15 @@ pub fn print_error(error: &GfileError) -> Result<(), GfileError> {
         code: json.code,
         exit_code: json.exit_code,
         message: json.message,
+    })
+}
+
+pub fn print_usage_error(message: String) -> Result<(), GfileError> {
+    print_json(&ErrorEnvelope {
+        status: "error",
+        code: "usage",
+        exit_code: 2,
+        message,
     })
 }
 
@@ -168,6 +180,15 @@ pub fn print_json(value: &impl Serialize) -> Result<(), GfileError> {
         what: format!("failed to serialize JSON output: {source}"),
         hint: "This is an internal output error; please report it.".to_owned(),
     })?;
-    println!("{text}");
-    Ok(())
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    match writeln!(stdout, "{text}") {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(source) => Err(GfileError::Io {
+            source,
+            path: Path::new("<stdout>").to_owned(),
+            op: IoOp::Write,
+        }),
+    }
 }

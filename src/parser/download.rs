@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
+use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::{error::GfileError, parser::size::parse_display_size};
@@ -20,6 +21,25 @@ const MATOMETE_DOWNLOAD_BUTTON_SELECTOR: &str = ".download_panel_btn_dl";
 const MATOMETE_ONCLICK_FILE_ID_RE: &str = r"download\(\d+, *'(.+?)'";
 const MATOMETE_SIZE_RE: &str = r"（(.+?)）";
 const KEY_INPUT_SELECTOR: &str = "#dlkey";
+
+type CachedSelector = LazyLock<Result<Selector, ()>>;
+
+static FILE_NAME_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(FILE_NAME_SELECTOR).map_err(|_| ()));
+static SIZE_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(SIZE_SELECTOR).map_err(|_| ()));
+static MATOMETE_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(MATOMETE_SELECTOR).map_err(|_| ()));
+static MATOMETE_ITEM_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(MATOMETE_ITEM_SELECTOR).map_err(|_| ()));
+static MATOMETE_NAME_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(MATOMETE_NAME_SELECTOR).map_err(|_| ()));
+static MATOMETE_SIZE_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(MATOMETE_SIZE_SELECTOR).map_err(|_| ()));
+static MATOMETE_DOWNLOAD_BUTTON_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(MATOMETE_DOWNLOAD_BUTTON_SELECTOR).map_err(|_| ()));
+static KEY_INPUT_SELECTOR_PARSED: CachedSelector =
+    LazyLock::new(|| Selector::parse(KEY_INPUT_SELECTOR).map_err(|_| ()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageInfo {
@@ -79,9 +99,9 @@ pub fn classify_page(html: &str, status: u16) -> PageState {
         return PageState::NeedsKey;
     }
 
-    if has_selector(&document, FILE_NAME_SELECTOR).unwrap_or(false)
-        || has_selector(&document, SIZE_SELECTOR).unwrap_or(false)
-        || has_selector(&document, MATOMETE_SELECTOR).unwrap_or(false)
+    if has_selector(&document, &FILE_NAME_SELECTOR_PARSED, FILE_NAME_SELECTOR).unwrap_or(false)
+        || has_selector(&document, &SIZE_SELECTOR_PARSED, SIZE_SELECTOR).unwrap_or(false)
+        || has_selector(&document, &MATOMETE_SELECTOR_PARSED, MATOMETE_SELECTOR).unwrap_or(false)
     {
         return PageState::Ok;
     }
@@ -113,29 +133,37 @@ pub fn classify_page(html: &str, status: u16) -> PageState {
 pub fn parse_download_page(html: &str, file_id: &str) -> Result<PageInfo, GfileError> {
     let document = Html::parse_document(html);
 
-    if has_selector(&document, MATOMETE_SELECTOR)? {
+    if has_selector(&document, &MATOMETE_SELECTOR_PARSED, MATOMETE_SELECTOR)? {
         return parse_matomete_page(&document);
     }
 
-    parse_single_file_page(html, file_id)
+    parse_single_file_document(&document, file_id)
 }
 
 pub fn parse_single_file_page(html: &str, file_id: &str) -> Result<PageInfo, GfileError> {
     let document = Html::parse_document(html);
-
-    if select_first_text(&document, MATOMETE_SELECTOR)?.is_some() {
+    if has_selector(&document, &MATOMETE_SELECTOR_PARSED, MATOMETE_SELECTOR)? {
         return Err(parse_error(
             "matomete pages are not implemented in M1",
             "This build only supports single-file pages; matomete support is scheduled for M2.",
         ));
     }
+    parse_single_file_document(&document, file_id)
+}
 
-    let raw_name = select_first_text(&document, FILE_NAME_SELECTOR)?
-        .ok_or_else(|| parse_error("missing #dl", parse_hint()))?;
+fn parse_single_file_document(document: &Html, file_id: &str) -> Result<PageInfo, GfileError> {
+    let raw_name = select_first_text(
+        document,
+        cached_selector(&FILE_NAME_SELECTOR_PARSED, FILE_NAME_SELECTOR)?,
+    )
+    .ok_or_else(|| parse_error("missing #dl", parse_hint()))?;
     debug!(raw_name = ?raw_name, "parsed raw_name");
 
-    let display_size = select_first_text(&document, SIZE_SELECTOR)?
-        .ok_or_else(|| parse_error("missing .dl_size", parse_hint()))?;
+    let display_size = select_first_text(
+        document,
+        cached_selector(&SIZE_SELECTOR_PARSED, SIZE_SELECTOR)?,
+    )
+    .ok_or_else(|| parse_error("missing .dl_size", parse_hint()))?;
     let approx_bytes = parse_display_size(&display_size);
 
     Ok(PageInfo {
@@ -151,8 +179,8 @@ pub fn parse_single_file_page(html: &str, file_id: &str) -> Result<PageInfo, Gfi
 }
 
 fn parse_matomete_page(document: &Html) -> Result<PageInfo, GfileError> {
-    let item_selector = parse_selector(MATOMETE_ITEM_SELECTOR)?;
-    let items: Vec<_> = document.select(&item_selector).collect();
+    let item_selector = cached_selector(&MATOMETE_ITEM_SELECTOR_PARSED, MATOMETE_ITEM_SELECTOR)?;
+    let items: Vec<_> = document.select(item_selector).collect();
     if items.is_empty() {
         return Err(parse_error(
             "matomete container has no .matomete_file items",
@@ -160,12 +188,21 @@ fn parse_matomete_page(document: &Html) -> Result<PageInfo, GfileError> {
         ));
     }
 
-    let onclick_re = Regex::new(MATOMETE_ONCLICK_FILE_ID_RE).expect("valid matomete onclick regex");
-    let size_re = Regex::new(MATOMETE_SIZE_RE).expect("valid matomete size regex");
+    static ONCLICK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(MATOMETE_ONCLICK_FILE_ID_RE).expect("valid matomete onclick regex")
+    });
+    static SIZE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(MATOMETE_SIZE_RE).expect("valid matomete size regex"));
+    let name_selector = cached_selector(&MATOMETE_NAME_SELECTOR_PARSED, MATOMETE_NAME_SELECTOR)?;
+    let button_selector = cached_selector(
+        &MATOMETE_DOWNLOAD_BUTTON_SELECTOR_PARSED,
+        MATOMETE_DOWNLOAD_BUTTON_SELECTOR,
+    )?;
+    let size_selector = cached_selector(&MATOMETE_SIZE_SELECTOR_PARSED, MATOMETE_SIZE_SELECTOR)?;
     let mut files = Vec::with_capacity(items.len());
 
     for item in items {
-        let raw_name = select_first_text_in(&item, MATOMETE_NAME_SELECTOR)?.ok_or_else(|| {
+        let raw_name = select_first_text_in(&item, name_selector).ok_or_else(|| {
             parse_error(
                 "missing matomete filename selector .matomete_file_info > span:nth-child(2)",
                 parse_hint(),
@@ -173,15 +210,14 @@ fn parse_matomete_page(document: &Html) -> Result<PageInfo, GfileError> {
         })?;
         debug!(raw_name = ?raw_name, "parsed matomete raw_name");
 
-        let onclick = select_first_attr_in(&item, MATOMETE_DOWNLOAD_BUTTON_SELECTOR, "onclick")?
-            .ok_or_else(|| {
-                parse_error(
-                    "missing matomete download onclick",
-                    "Page structure may have changed; rerun with --dump-page and -vv.",
-                )
-            })?;
-        let file_id = onclick_re
-            .captures(&onclick)
+        let onclick = select_first_attr_in(&item, button_selector, "onclick").ok_or_else(|| {
+            parse_error(
+                "missing matomete download onclick",
+                "Page structure may have changed; rerun with --dump-page and -vv.",
+            )
+        })?;
+        let file_id = ONCLICK_RE
+            .captures(onclick)
             .and_then(|captures| captures.get(1))
             .map(|value| value.as_str().to_owned())
             .ok_or_else(|| {
@@ -191,13 +227,13 @@ fn parse_matomete_page(document: &Html) -> Result<PageInfo, GfileError> {
                 )
             })?;
 
-        let size_text = select_first_text_in(&item, MATOMETE_SIZE_SELECTOR)?.ok_or_else(|| {
+        let size_text = select_first_text_in(&item, size_selector).ok_or_else(|| {
             parse_error(
                 "missing matomete size selector .matomete_file_info > span:nth-child(3)",
                 parse_hint(),
             )
         })?;
-        let display_size = size_re
+        let display_size = SIZE_RE
             .captures(&size_text)
             .and_then(|captures| captures.get(1))
             .map(|value| value.as_str().trim().to_owned())
@@ -221,55 +257,54 @@ fn parse_matomete_page(document: &Html) -> Result<PageInfo, GfileError> {
     })
 }
 
-fn select_first_text(document: &Html, selector: &str) -> Result<Option<String>, GfileError> {
-    let selector = parse_selector(selector)?;
-
-    Ok(document
-        .select(&selector)
+fn select_first_text(document: &Html, selector: &Selector) -> Option<String> {
+    document
+        .select(selector)
         .next()
-        .map(|node| node.text().collect::<String>().trim().to_owned()))
+        .map(|node| node.text().collect::<String>().trim().to_owned())
 }
 
-fn select_first_text_in(
-    element: &ElementRef<'_>,
-    selector: &str,
-) -> Result<Option<String>, GfileError> {
-    let selector = parse_selector(selector)?;
-    Ok(element
-        .select(&selector)
+fn select_first_text_in(element: &ElementRef<'_>, selector: &Selector) -> Option<String> {
+    element
+        .select(selector)
         .next()
-        .map(|node| node.text().collect::<String>().trim().to_owned()))
+        .map(|node| node.text().collect::<String>().trim().to_owned())
 }
 
-fn select_first_attr_in(
-    element: &ElementRef<'_>,
-    selector: &str,
+fn select_first_attr_in<'a>(
+    element: &ElementRef<'a>,
+    selector: &Selector,
     attr: &str,
-) -> Result<Option<String>, GfileError> {
-    let selector = parse_selector(selector)?;
-    Ok(element
-        .select(&selector)
+) -> Option<&'a str> {
+    element
+        .select(selector)
         .next()
         .and_then(|node| node.value().attr(attr))
-        .map(ToOwned::to_owned))
 }
 
-fn has_selector(document: &Html, selector: &str) -> Result<bool, GfileError> {
-    let selector = parse_selector(selector)?;
-    Ok(document.select(&selector).next().is_some())
+fn has_selector(
+    document: &Html,
+    selector: &CachedSelector,
+    source: &str,
+) -> Result<bool, GfileError> {
+    let selector = cached_selector(selector, source)?;
+    Ok(document.select(selector).next().is_some())
 }
 
 fn has_enabled_key_input(document: &Html) -> Result<bool, GfileError> {
-    let selector = parse_selector(KEY_INPUT_SELECTOR)?;
+    let selector = cached_selector(&KEY_INPUT_SELECTOR_PARSED, KEY_INPUT_SELECTOR)?;
     Ok(document
-        .select(&selector)
+        .select(selector)
         .any(|node| node.value().attr("disabled").is_none()))
 }
 
-fn parse_selector(selector: &str) -> Result<Selector, GfileError> {
-    Selector::parse(selector).map_err(|_| {
+fn cached_selector<'a>(
+    selector: &'a CachedSelector,
+    source: &str,
+) -> Result<&'a Selector, GfileError> {
+    selector.as_ref().map_err(|()| {
         parse_error(
-            format!("invalid selector {selector}"),
+            format!("invalid selector {source}"),
             "This is an internal parser bug; please report it.",
         )
     })

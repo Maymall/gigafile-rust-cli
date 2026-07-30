@@ -34,6 +34,33 @@ fn parse_single_japanese_fixture_preserves_name_bytes() {
 }
 
 #[test]
+fn single_entry_points_return_identical_page_info() {
+    let html = include_str!("fixtures/single_basic.html");
+
+    assert_eq!(
+        parse_download_page(html, FILE_ID).unwrap(),
+        parse_single_file_page(html, FILE_ID).unwrap()
+    );
+}
+
+#[test]
+fn single_entry_point_still_rejects_matomete_pages() {
+    let error = parse_single_file_page(include_str!("fixtures/matomete_two_files.html"), FILE_ID)
+        .expect_err("single-file parser should reject matomete pages");
+
+    match error {
+        GfileError::Parse { what, hint } => {
+            assert_eq!(what, "matomete pages are not implemented in M1");
+            assert_eq!(
+                hint,
+                "This build only supports single-file pages; matomete support is scheduled for M2."
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn parse_matomete_two_files_fixture_extracts_files() {
     let page =
         parse_download_page(include_str!("fixtures/matomete_two_files.html"), FILE_ID).unwrap();

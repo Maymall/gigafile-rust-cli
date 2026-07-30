@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use std::path::Path;
+use std::{borrow::Cow, fmt::Write as _, path::Path};
 
 use tracing::debug;
 
@@ -35,7 +35,27 @@ pub fn sanitize_server_filename(raw_name: &str, file_id: &str) -> String {
 pub fn log_name_diagnostics(raw_name: &str, sanitized_name: &str, final_path: &Path) {
     debug!("raw_name={raw_name:?}");
     debug!("sanitized_name={sanitized_name}");
-    debug!("final_path={}", final_path.display());
+    debug!("final_path={final_path:?}");
+}
+
+pub fn escape_terminal_text(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => {
+                write!(escaped, "\\u{{{:x}}}", ch as u32).expect("writing to a String cannot fail");
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 fn is_forbidden(ch: char) -> bool {
@@ -189,5 +209,13 @@ mod tests {
             sanitize_server_filename("テスト:資料?.zip", FILE_ID),
             "テスト_資料_.zip"
         );
+    }
+
+    #[test]
+    fn terminal_text_escapes_controls_and_preserves_unicode() {
+        let escaped = escape_terminal_text("資料\n\t\x1b[31m.txt");
+
+        assert_eq!(escaped, r"資料\n\t\u{1b}[31m.txt");
+        assert!(!escaped.chars().any(char::is_control));
     }
 }

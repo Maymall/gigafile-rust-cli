@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs::{File as StdFile, OpenOptions as StdOpenOptions},
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Read as _},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
+use bytes::Bytes;
 use fs2::FileExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
@@ -20,11 +21,16 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
+
 use crate::{
     error::{GfileError, IoOp, boxed, internal_error, io_error, network_error},
-    http,
+    fsutil, http,
     jsonout::{self, ErrorJson},
-    naming::{log_name_diagnostics, sanitize_server_filename},
+    naming::{escape_terminal_text, log_name_diagnostics, sanitize_server_filename},
     parser::download::{
         PageInfo, PageKind, PageState, RemoteFile, classify_page, parse_download_page,
     },
@@ -43,6 +49,12 @@ const THREADS_RESUME_HINT: &str = "This often happens when a previous attempt us
 const MAX_ACTIVE_SEGMENT_WORKERS: usize = 4;
 const MIN_ADAPTIVE_SEGMENT_WORKERS: usize = 2;
 const SEGMENT_SUCCESSES_BEFORE_PROBE: usize = 2;
+const MAX_SELECTION_ITEMS: usize = 10_000;
+// Persisting a complete JSON sidecar for every HTTP chunk can turn a large
+// download into a metadata-heavy workload (and blocks the Tokio worker). A
+// checkpoint is conservative: a crash may re-fetch at most this window.
+const SEGMENT_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SIDECAR_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
@@ -80,6 +92,15 @@ impl FileSelection {
                 if start > end {
                     return Err(selection_usage("range start is greater than range end"));
                 }
+                let count = end
+                    .checked_sub(start)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| selection_usage("selection range is too large"))?;
+                if count > MAX_SELECTION_ITEMS
+                    || indexes.len().saturating_add(count) > MAX_SELECTION_ITEMS
+                {
+                    return Err(selection_usage("selection range is too large"));
+                }
                 indexes.extend(start..=end);
             } else {
                 indexes.insert(parse_selection_index(part)?);
@@ -87,6 +108,9 @@ impl FileSelection {
         }
         if indexes.is_empty() {
             return Err(selection_usage("selection is empty"));
+        }
+        if indexes.len() > MAX_SELECTION_ITEMS {
+            return Err(selection_usage("selection contains too many indexes"));
         }
         Ok(Self {
             indexes: indexes.into_iter().collect(),
@@ -131,12 +155,21 @@ struct SingleDownloadOutcome {
     threads: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum HttpValidator {
+    StrongEtag(String),
+    LastModified(String),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PartSidecar {
     version: u8,
     file_id: String,
     expected: Option<u64>,
     key_used: bool,
+    #[serde(default)]
+    validator: Option<HttpValidator>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +178,8 @@ struct SegmentSidecar {
     file_id: String,
     expected: u64,
     key_used: bool,
+    #[serde(default)]
+    validator: Option<HttpValidator>,
     segments: Vec<SegmentState>,
 }
 
@@ -162,6 +197,7 @@ struct SegmentResumePlan {
     part_path: PathBuf,
     sidecar_path: PathBuf,
     expected: u64,
+    validator: Option<HttpValidator>,
     segments: Vec<SegmentState>,
     resumed: bool,
 }
@@ -191,6 +227,7 @@ struct ResumePlan {
     sidecar_path: PathBuf,
     range_start: Option<u64>,
     expected: Option<u64>,
+    validator: Option<HttpValidator>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +236,13 @@ struct TransferPlan {
     initial_bytes: u64,
     expected_total: Option<u64>,
     resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PartOpenMode {
+    CreateOrTruncate,
+    AppendExisting,
+    WriteExisting,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +267,7 @@ struct SegmentContext {
     file_id: String,
     expected: u64,
     key_used: bool,
+    validator: Option<HttpValidator>,
     timeout: Duration,
     progress: SegmentedProgress,
     shared_segments: Arc<Mutex<Vec<SegmentState>>>,
@@ -231,8 +276,12 @@ struct SegmentContext {
 struct SegmentWork {
     index: usize,
     attempt: u32,
-    delay: Option<Duration>,
     initial: Option<InitialSegmentWork>,
+}
+
+struct ScheduledSegmentWork {
+    ready_at: tokio::time::Instant,
+    work: SegmentWork,
 }
 
 struct InitialSegmentWork {
@@ -244,6 +293,15 @@ struct SegmentWorkResult {
     index: usize,
     attempt: u32,
     result: Result<(), SegmentDownloadError>,
+}
+
+struct BatchTargetRegistry {
+    state: Option<Mutex<BatchTargetState>>,
+}
+
+struct BatchTargetState {
+    initially_present: HashSet<PathBuf>,
+    claimed: HashMap<PathBuf, String>,
 }
 
 struct DownloadLock {
@@ -279,11 +337,87 @@ impl DownloadLock {
 impl Drop for DownloadLock {
     fn drop(&mut self) {
         if let Err(source) = FileExt::unlock(&self.file) {
-            warn!(
-                "failed to release download lock {}: {source}",
-                self.path.display()
-            );
+            warn!(path = ?self.path, %source, "failed to release download lock");
         }
+    }
+}
+
+impl BatchTargetRegistry {
+    fn for_page(kind: PageKind, output: Option<&Path>) -> Result<Self, GfileError> {
+        if kind != PageKind::Matomete {
+            return Ok(Self { state: None });
+        }
+
+        let output_dir = match output {
+            Some(path) => path.to_owned(),
+            None => std::env::current_dir()
+                .map_err(|source| io_error(source, Path::new("."), IoOp::Metadata))?,
+        };
+        let entries = std::fs::read_dir(&output_dir)
+            .map_err(|source| io_error(source, &output_dir, IoOp::Read))?;
+        let mut initially_present = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| io_error(source, &output_dir, IoOp::Read))?;
+            initially_present.insert(entry.path());
+        }
+
+        Ok(Self {
+            state: Some(Mutex::new(BatchTargetState {
+                initially_present,
+                claimed: HashMap::new(),
+            })),
+        })
+    }
+
+    fn check_available(&self, path: &Path, file_id: &str, force: bool) -> Result<(), GfileError> {
+        let Some(state) = &self.state else {
+            return ensure_unclaimed_target_available(path, force);
+        };
+        let state = state
+            .lock()
+            .map_err(|_| internal_error("batch target registry lock was poisoned"))?;
+        if state
+            .claimed
+            .get(path)
+            .is_some_and(|owner| owner != file_id)
+            || (path.exists() && (!force || !state.initially_present.contains(path)))
+        {
+            return Err(target_exists(path));
+        }
+        Ok(())
+    }
+
+    fn claim(&self, path: &Path, file_id: &str, force: bool) -> Result<(), GfileError> {
+        let Some(state) = &self.state else {
+            return ensure_unclaimed_target_available(path, force);
+        };
+        let mut state = state
+            .lock()
+            .map_err(|_| internal_error("batch target registry lock was poisoned"))?;
+        if let Some(owner) = state.claimed.get(path) {
+            if owner == file_id {
+                return Ok(());
+            }
+            return Err(target_exists(path));
+        }
+        if path.exists() && (!force || !state.initially_present.contains(path)) {
+            return Err(target_exists(path));
+        }
+        state.claimed.insert(path.to_owned(), file_id.to_owned());
+        Ok(())
+    }
+
+    fn may_replace_existing(&self, path: &Path, force: bool) -> Result<bool, GfileError> {
+        if !force {
+            return Ok(false);
+        }
+        let Some(state) = &self.state else {
+            return Ok(true);
+        };
+        let state = state
+            .lock()
+            .map_err(|_| internal_error("batch target registry lock was poisoned"))?;
+        Ok(state.initially_present.contains(path))
     }
 }
 
@@ -301,21 +435,26 @@ pub fn validate_threads(threads: u8) -> Result<u8, GfileError> {
 
 pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, GfileError> {
     let url_info = parse_download_url(&options.url, options.allow_any_host)?;
-    let client = http::build_client(options.user_agent.as_deref())?;
+    let client =
+        http::build_gigafile_client(options.user_agent.as_deref(), options.allow_any_host)?;
 
-    let page_response = http::get_with_retries(
+    let page_response = http::get_with_retries_and_timeout(
         &client,
         &url_info.page_url,
         options.retries,
         "fetching page",
+        Some(options.timeout),
     )
     .await?;
     let page_status = page_response.status().as_u16();
     let final_page_url = page_response.url().clone();
-    let page_bytes = page_response
-        .bytes()
-        .await
-        .map_err(|source| network_error(source, "reading download page body"))?;
+    let page_bytes = http::read_body_limited(
+        page_response,
+        http::PAGE_BODY_LIMIT,
+        options.timeout,
+        "reading download page body",
+    )
+    .await?;
 
     if let Some(path) = &options.dump_page {
         fs::write(path, &page_bytes)
@@ -349,6 +488,7 @@ pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, Gf
     let page = parse_download_page(&html, &url_info.file_id)?;
     validate_selection(&page, options.selection.as_ref())?;
     validate_output_for_page(&page, options.output.as_deref())?;
+    let batch_targets = BatchTargetRegistry::for_page(page.kind, options.output.as_deref())?;
 
     let selected_files = selected_files(&page, options.selection.as_ref());
     let mut records = Vec::with_capacity(selected_files.len());
@@ -356,7 +496,9 @@ pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, Gf
     for remote_file in selected_files {
         let final_path =
             resolve_output_path(remote_file, page.kind, options.output.as_deref()).await?;
-        if let Err(error) = ensure_target_available(&final_path, options.force) {
+        if let Err(error) =
+            batch_targets.check_available(&final_path, &remote_file.file_id, options.force)
+        {
             if page.kind == PageKind::Single {
                 return Err(error);
             }
@@ -374,8 +516,15 @@ pub async fn download(mut options: DownloadOptions) -> Result<DownloadReport, Gf
         log_name_diagnostics(&remote_file.raw_name, &sanitized_name, &final_path);
         let download_url = url_info.download_url_for(&remote_file.file_id, options.key.as_deref());
 
-        match download_file_with_retries(&client, &download_url, remote_file, &final_path, &options)
-            .await
+        match download_file_with_retries(
+            &client,
+            &download_url,
+            remote_file,
+            &final_path,
+            &options,
+            &batch_targets,
+        )
+        .await
         {
             Ok(outcome) => records.push(DownloadFileRecord {
                 name: outcome.name.unwrap_or_else(|| remote_file.raw_name.clone()),
@@ -499,11 +648,21 @@ async fn download_file_with_retries(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let _download_lock = DownloadLock::acquire(final_path)?;
     let mut attempt = 0;
     loop {
-        match try_download_file(client, download_url, remote_file, final_path, options).await {
+        match try_download_file(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await
+        {
             Ok(outcome) => return Ok(outcome),
             Err(error) if http::is_retryable(&error) && attempt < options.retries => {
                 warn!(
@@ -524,6 +683,7 @@ async fn try_download_file(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     if options.threads > DEFAULT_DOWNLOAD_THREADS {
         return try_download_file_segmented_or_fallback(
@@ -532,11 +692,20 @@ async fn try_download_file(
             remote_file,
             final_path,
             options,
+            batch_targets,
         )
         .await;
     }
 
-    try_download_file_sequential(client, download_url, remote_file, final_path, options).await
+    try_download_file_sequential(
+        client,
+        download_url,
+        remote_file,
+        final_path,
+        options,
+        batch_targets,
+    )
+    .await
 }
 
 async fn try_download_file_sequential(
@@ -545,26 +714,45 @@ async fn try_download_file_sequential(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let target_path = final_path.to_owned();
     let header_output_dir = header_filename_output_dir(final_path, options.output.as_deref())?;
     let mut resume = prepare_resume(&target_path, remote_file, options).await?;
-    let mut response =
-        send_download_request(client, download_url, resume.range_start, options).await?;
+    let mut response = send_download_request(
+        client,
+        download_url,
+        resume.range_start,
+        resume.validator.as_ref(),
+        options,
+    )
+    .await?;
 
     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        batch_targets.claim(&target_path, &remote_file.file_id, options.force)?;
+        let replace_existing = batch_targets.may_replace_existing(&target_path, options.force)?;
         if let Some(outcome) =
-            complete_if_range_already_finished(&resume, &target_path, options).await?
+            complete_if_range_already_finished(&response, &resume, &target_path, replace_existing)
+                .await?
         {
             return Ok(outcome);
         }
-        warn!("server rejected resume range before expected size; restarting from zero");
+        warn!("server did not confirm the completed resume range; restarting from zero");
         remove_if_exists(&resume.part_path).await?;
         remove_if_exists(&resume.sidecar_path).await?;
         resume.range_start = None;
         resume.expected = None;
-        response = send_download_request(client, download_url, None, options).await?;
+        resume.validator = None;
+        response = send_download_request(client, download_url, None, None, options).await?;
     }
+    restart_sequential_if_validator_mismatch(
+        client,
+        download_url,
+        &mut response,
+        &mut resume,
+        options,
+    )
+    .await?;
 
     consume_download_response_sequential(
         client,
@@ -577,6 +765,7 @@ async fn try_download_file_sequential(
             resume,
         },
         options,
+        batch_targets,
     )
     .await
 }
@@ -587,6 +776,7 @@ async fn consume_download_response_sequential(
     remote_file: &RemoteFile,
     plan: SequentialDownloadPlan,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let SequentialDownloadPlan {
         mut response,
@@ -600,12 +790,15 @@ async fn consume_download_response_sequential(
     }
 
     if is_html_content_type(response.headers()) {
-        let body = response
-            .text()
-            .await
-            .map_err(|source| network_error(source, "reading HTML download error body"))?;
+        let body = http::read_body_limited(
+            response,
+            http::PAGE_BODY_LIMIT,
+            options.timeout,
+            "reading HTML download error body",
+        )
+        .await?;
         return Err(classify_html_response(
-            &body,
+            &String::from_utf8_lossy(&body),
             options.key.is_some(),
             "download response content-type is HTML",
         ));
@@ -616,33 +809,54 @@ async fn consume_download_response_sequential(
         if let (Some(dir), Some(name)) = (header_output_dir.as_deref(), header_name.as_deref()) {
             let header_path = dir.join(sanitize_server_filename(name, &remote_file.file_id));
             if header_path != target_path {
-                ensure_target_available(&header_path, options.force)?;
+                batch_targets.check_available(&header_path, &remote_file.file_id, options.force)?;
                 let lock = DownloadLock::acquire(&header_path)?;
                 let header_resume = prepare_resume(&header_path, remote_file, options).await?;
                 let should_retry_with_header_resume = header_resume.range_start.is_some();
                 target_path = header_path;
                 resume = header_resume;
+                batch_targets.claim(&target_path, &remote_file.file_id, options.force)?;
                 if should_retry_with_header_resume {
-                    response =
-                        send_download_request(client, download_url, resume.range_start, options)
-                            .await?;
+                    response = send_download_request(
+                        client,
+                        download_url,
+                        resume.range_start,
+                        resume.validator.as_ref(),
+                        options,
+                    )
+                    .await?;
                     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-                        if let Some(outcome) =
-                            complete_if_range_already_finished(&resume, &target_path, options)
-                                .await?
+                        let replace_existing =
+                            batch_targets.may_replace_existing(&target_path, options.force)?;
+                        if let Some(outcome) = complete_if_range_already_finished(
+                            &response,
+                            &resume,
+                            &target_path,
+                            replace_existing,
+                        )
+                        .await?
                         {
                             return Ok(outcome);
                         }
                         warn!(
-                            "server rejected resume range before expected size; restarting from zero"
+                            "server did not confirm the completed resume range; restarting from zero"
                         );
                         remove_if_exists(&resume.part_path).await?;
                         remove_if_exists(&resume.sidecar_path).await?;
                         resume.range_start = None;
                         resume.expected = None;
-                        response =
-                            send_download_request(client, download_url, None, options).await?;
+                        resume.validator = None;
+                        response = send_download_request(client, download_url, None, None, options)
+                            .await?;
                     }
+                    restart_sequential_if_validator_mismatch(
+                        client,
+                        download_url,
+                        &mut response,
+                        &mut resume,
+                        options,
+                    )
+                    .await?;
                 }
                 Some(lock)
             } else {
@@ -654,18 +868,22 @@ async fn consume_download_response_sequential(
     } else {
         None
     };
+    batch_targets.claim(&target_path, &remote_file.file_id, options.force)?;
 
     if !response.status().is_success() {
         return Err(http::status_error(response.status(), download_url));
     }
 
     if is_html_content_type(response.headers()) {
-        let body = response
-            .text()
-            .await
-            .map_err(|source| network_error(source, "reading HTML download error body"))?;
+        let body = http::read_body_limited(
+            response,
+            http::PAGE_BODY_LIMIT,
+            options.timeout,
+            "reading HTML download error body",
+        )
+        .await?;
         return Err(classify_html_response(
-            &body,
+            &String::from_utf8_lossy(&body),
             options.key.is_some(),
             "download response content-type is HTML",
         ));
@@ -687,12 +905,11 @@ async fn consume_download_response_sequential(
         }
     };
 
-    if content_type_is_missing(response.headers()) {
-        if let Some(chunk) = first_chunk.as_deref() {
-            if let Some(error) = classify_ambiguous_body_probe(chunk, options.key.is_some()) {
-                return Err(error);
-            }
-        }
+    if content_type_is_missing(response.headers())
+        && let Some(chunk) = first_chunk.as_deref()
+        && let Some(error) = classify_ambiguous_body_probe(chunk, options.key.is_some())
+    {
+        return Err(error);
     }
 
     write_sidecar(
@@ -700,8 +917,8 @@ async fn consume_download_response_sequential(
         remote_file,
         transfer.expected_total,
         options.key.is_some(),
-    )
-    .await?;
+        validator_from_headers(response.headers()),
+    )?;
     crate::interrupt::set_active_download(Some(crate::interrupt::ActiveDownload {
         part_path: resume.part_path.clone(),
         sidecar_path: resume.sidecar_path.clone(),
@@ -709,13 +926,11 @@ async fn consume_download_response_sequential(
     }));
 
     let file = if transfer.append {
-        OpenOptions::new()
-            .append(true)
-            .open(&resume.part_path)
+        open_part_file(&resume.part_path, PartOpenMode::AppendExisting)
             .await
             .map_err(|source| io_error(source, &resume.part_path, IoOp::Write))?
     } else {
-        File::create(&resume.part_path)
+        open_part_file(&resume.part_path, PartOpenMode::CreateOrTruncate)
             .await
             .map_err(|source| io_error(source, &resume.part_path, IoOp::Create))?
     };
@@ -770,34 +985,32 @@ async fn consume_download_response_sequential(
     }
     progress.finish();
 
-    if let Some(expected) = transfer.expected_total {
-        if actual != expected {
-            writer
-                .flush()
-                .await
-                .map_err(|source| io_error(source, &resume.part_path, IoOp::Write))?;
-            return Err(GfileError::SizeMismatch { expected, actual });
-        }
+    if let Some(expected) = transfer.expected_total
+        && actual != expected
+    {
+        writer
+            .flush()
+            .await
+            .map_err(|source| io_error(source, &resume.part_path, IoOp::Write))?;
+        return Err(GfileError::SizeMismatch { expected, actual });
     }
 
     writer
         .flush()
         .await
         .map_err(|source| io_error(source, &resume.part_path, IoOp::Write))?;
-    let file = writer.into_inner();
-    file.sync_all()
-        .await
-        .map_err(|source| io_error(source, &resume.part_path, IoOp::Write))?;
+    drop(writer);
 
+    let replace_existing = batch_targets.may_replace_existing(&target_path, options.force)?;
     promote_part(
         &resume.part_path,
         &resume.sidecar_path,
         &target_path,
-        options.force,
+        replace_existing,
     )
     .await?;
 
-    info!("downloaded {} bytes to {}", actual, target_path.display());
+    info!(bytes = actual, path = ?target_path, "download complete");
 
     Ok(SingleDownloadOutcome {
         name: header_name,
@@ -814,6 +1027,7 @@ async fn try_download_file_segmented_or_fallback(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     if let Some(segment_resume) =
         load_existing_segmented_resume(final_path, remote_file, options).await?
@@ -825,11 +1039,20 @@ async fn try_download_file_segmented_or_fallback(
             final_path,
             segment_resume,
             options,
+            batch_targets,
         )
         .await;
     }
 
-    try_download_file_segmented_fresh(client, download_url, remote_file, final_path, options).await
+    try_download_file_segmented_fresh(
+        client,
+        download_url,
+        remote_file,
+        final_path,
+        options,
+        batch_targets,
+    )
+    .await
 }
 
 async fn try_download_file_segmented_fresh(
@@ -838,9 +1061,11 @@ async fn try_download_file_segmented_fresh(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let range_end = initial_segment_end(remote_file, options.threads);
-    let response = send_range_request(client, download_url, 0, range_end, options.timeout).await?;
+    let response =
+        send_range_request(client, download_url, 0, range_end, None, options.timeout).await?;
     if response.status() == StatusCode::OK {
         warn!(
             "segmented download was not accepted by the server: server returned HTTP 200 to the first Range request; consuming this response with one connection"
@@ -852,6 +1077,7 @@ async fn try_download_file_segmented_fresh(
             remote_file,
             final_path,
             options,
+            batch_targets,
         )
         .await;
     }
@@ -863,16 +1089,27 @@ async fn try_download_file_segmented_fresh(
             "segmented download was not accepted by the server: server returned HTTP {} to the first Range request; falling back to one connection",
             response.status().as_u16()
         );
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
 
     if is_html_content_type(response.headers()) {
-        let body = response
-            .text()
-            .await
-            .map_err(|source| network_error(source, "reading HTML download error body"))?;
+        let body = http::read_body_limited(
+            response,
+            http::PAGE_BODY_LIMIT,
+            options.timeout,
+            "reading HTML download error body",
+        )
+        .await?;
         return Err(classify_html_response(
-            &body,
+            &String::from_utf8_lossy(&body),
             options.key.is_some(),
             "download response content-type is HTML",
         ));
@@ -887,19 +1124,45 @@ async fn try_download_file_segmented_fresh(
             "segmented download was not accepted by the server: Content-Range was {}-{}, expected 0-{range_end}; falling back to one connection",
             content_range.start, content_range.end
         );
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
     let Some(expected) = content_range.total else {
         warn!(
             "segmented download response has no Content-Range total; falling back to one connection"
         );
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     };
     if expected == 0 {
         warn!("empty file download uses the single-connection path");
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
     warn_on_display_size_mismatch(remote_file, Some(expected));
+
+    let validator = validator_from_headers(response.headers());
 
     let header_name = content_disposition_filename(response.headers());
     let header_output_dir = header_filename_output_dir(final_path, options.output.as_deref())?;
@@ -908,7 +1171,7 @@ async fn try_download_file_segmented_fresh(
         if let (Some(dir), Some(name)) = (header_output_dir.as_deref(), header_name.as_deref()) {
             let header_path = dir.join(sanitize_server_filename(name, &remote_file.file_id));
             if header_path != target_path {
-                ensure_target_available(&header_path, options.force)?;
+                batch_targets.check_available(&header_path, &remote_file.file_id, options.force)?;
                 let lock = DownloadLock::acquire(&header_path)?;
                 target_path = header_path;
                 Some(lock)
@@ -918,6 +1181,7 @@ async fn try_download_file_segmented_fresh(
         } else {
             None
         };
+    batch_targets.claim(&target_path, &remote_file.file_id, options.force)?;
 
     if let Some(segment_resume) =
         load_existing_segmented_resume(&target_path, remote_file, options).await?
@@ -931,6 +1195,7 @@ async fn try_download_file_segmented_fresh(
             &target_path,
             segment_resume,
             options,
+            batch_targets,
         )
         .await;
     }
@@ -941,6 +1206,7 @@ async fn try_download_file_segmented_fresh(
         part_path,
         sidecar_path,
         expected,
+        validator,
         segments,
         resumed: false,
     };
@@ -962,17 +1228,24 @@ async fn try_download_file_segmented_fresh(
             },
         },
         options,
+        batch_targets,
     )
     .await
     {
         Ok(outcome) => Ok(outcome),
         Err(SegmentDownloadError::Fallback(reason)) => {
-            warn!(
-                "segmented download was not accepted by the server: {reason}; falling back to one connection"
-            );
+            warn!(reason = ?reason, "segmented download was not accepted; falling back to one connection");
             remove_if_exists(&part_path).await?;
             remove_if_exists(&sidecar_path).await?;
-            sequential_fallback(client, download_url, remote_file, &target_path, options).await
+            sequential_fallback(
+                client,
+                download_url,
+                remote_file,
+                &target_path,
+                options,
+                batch_targets,
+            )
+            .await
         }
         Err(SegmentDownloadError::Failed(error)) => Err(error),
     }
@@ -985,13 +1258,16 @@ async fn try_download_file_segmented_resume(
     final_path: &Path,
     segment_resume: SegmentResumePlan,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
+    batch_targets.claim(final_path, &remote_file.file_id, options.force)?;
     let Some((index, segment)) = first_incomplete_segment(&segment_resume.segments) else {
+        let replace_existing = batch_targets.may_replace_existing(final_path, options.force)?;
         promote_part(
             &segment_resume.part_path,
             &segment_resume.sidecar_path,
             final_path,
-            options.force,
+            replace_existing,
         )
         .await?;
         return Ok(SingleDownloadOutcome {
@@ -1008,6 +1284,7 @@ async fn try_download_file_segmented_resume(
         download_url,
         range_start,
         segment.end,
+        segment_resume.validator.as_ref(),
         options.timeout,
     )
     .await?;
@@ -1024,6 +1301,7 @@ async fn try_download_file_segmented_resume(
             remote_file,
             final_path,
             options,
+            batch_targets,
         )
         .await;
     }
@@ -1037,30 +1315,71 @@ async fn try_download_file_segmented_resume(
         );
         remove_if_exists(&segment_resume.part_path).await?;
         remove_if_exists(&segment_resume.sidecar_path).await?;
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
+    }
+
+    if !validator_matches_headers(segment_resume.validator.as_ref(), response.headers()) {
+        warn!("segmented resume response validator changed; clearing segments and restarting");
+        remove_if_exists(&segment_resume.part_path).await?;
+        remove_if_exists(&segment_resume.sidecar_path).await?;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
 
     let content_range = parse_content_range(response.headers())?;
     if content_range.start != range_start || content_range.end != segment.end {
         warn!(
-            "segmented download was not accepted by the server: Content-Range was {}-{}, expected {range_start}-{}; falling back to one connection",
-            content_range.start, content_range.end, segment.end
+            start = content_range.start,
+            end = content_range.end,
+            expected_start = range_start,
+            expected_end = segment.end,
+            "segmented download was not accepted; Content-Range mismatch"
         );
         remove_if_exists(&segment_resume.part_path).await?;
         remove_if_exists(&segment_resume.sidecar_path).await?;
-        return sequential_fallback(client, download_url, remote_file, final_path, options).await;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
-    if let Some(total) = content_range.total {
-        if total != segment_resume.expected {
-            warn!(
-                "segmented download was not accepted by the server: Content-Range total is {total}, expected {}; falling back to one connection",
-                segment_resume.expected
-            );
-            remove_if_exists(&segment_resume.part_path).await?;
-            remove_if_exists(&segment_resume.sidecar_path).await?;
-            return sequential_fallback(client, download_url, remote_file, final_path, options)
-                .await;
-        }
+    if let Some(total) = content_range.total
+        && total != segment_resume.expected
+    {
+        warn!(
+            "segmented download was not accepted by the server: Content-Range total is {total}, expected {}; falling back to one connection",
+            segment_resume.expected
+        );
+        remove_if_exists(&segment_resume.part_path).await?;
+        remove_if_exists(&segment_resume.sidecar_path).await?;
+        return sequential_fallback(
+            client,
+            download_url,
+            remote_file,
+            final_path,
+            options,
+            batch_targets,
+        )
+        .await;
     }
 
     let header_name = content_disposition_filename(response.headers());
@@ -1081,17 +1400,24 @@ async fn try_download_file_segmented_resume(
             },
         },
         options,
+        batch_targets,
     )
     .await
     {
         Ok(outcome) => Ok(outcome),
         Err(SegmentDownloadError::Fallback(reason)) => {
-            warn!(
-                "segmented download was not accepted by the server: {reason}; falling back to one connection"
-            );
+            warn!(reason = ?reason, "segmented download was not accepted; falling back to one connection");
             remove_if_exists(&part_path).await?;
             remove_if_exists(&sidecar_path).await?;
-            sequential_fallback(client, download_url, remote_file, final_path, options).await
+            sequential_fallback(
+                client,
+                download_url,
+                remote_file,
+                final_path,
+                options,
+                batch_targets,
+            )
+            .await
         }
         Err(SegmentDownloadError::Failed(error)) => Err(error),
     }
@@ -1104,6 +1430,7 @@ async fn consume_200_fallback_response(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let mut sequential_options = options.clone();
     sequential_options.threads = DEFAULT_DOWNLOAD_THREADS;
@@ -1122,6 +1449,7 @@ async fn consume_200_fallback_response(
             resume,
         },
         &sequential_options,
+        batch_targets,
     )
     .await
 }
@@ -1132,6 +1460,7 @@ async fn sequential_fallback(
     remote_file: &RemoteFile,
     final_path: &Path,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, GfileError> {
     let mut sequential_options = options.clone();
     sequential_options.threads = DEFAULT_DOWNLOAD_THREADS;
@@ -1142,6 +1471,7 @@ async fn sequential_fallback(
         remote_file,
         final_path,
         &sequential_options,
+        batch_targets,
     )
     .await
 }
@@ -1153,6 +1483,7 @@ async fn try_download_file_segmented(
     final_path: &Path,
     plan: SegmentedDownloadPlan,
     options: &DownloadOptions,
+    batch_targets: &BatchTargetRegistry,
 ) -> Result<SingleDownloadOutcome, SegmentDownloadError> {
     let SegmentedDownloadPlan {
         header_name,
@@ -1161,11 +1492,7 @@ async fn try_download_file_segmented(
     } = plan;
     let expected = segment_resume.expected;
     let part_file = if segment_resume.resumed {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&segment_resume.part_path)
+        open_part_file(&segment_resume.part_path, PartOpenMode::WriteExisting)
             .await
             .map_err(|source| {
                 SegmentDownloadError::Failed(io_error(
@@ -1175,7 +1502,7 @@ async fn try_download_file_segmented(
                 ))
             })?
     } else {
-        File::create(&segment_resume.part_path)
+        open_part_file(&segment_resume.part_path, PartOpenMode::CreateOrTruncate)
             .await
             .map_err(|source| {
                 SegmentDownloadError::Failed(io_error(
@@ -1195,9 +1522,9 @@ async fn try_download_file_segmented(
         &remote_file.file_id,
         expected,
         options.key.is_some(),
+        segment_resume.validator.as_ref(),
         &segment_resume.segments,
     )
-    .await
     .map_err(SegmentDownloadError::Failed)?;
     crate::interrupt::set_active_download(Some(crate::interrupt::ActiveDownload {
         part_path: segment_resume.part_path.clone(),
@@ -1229,6 +1556,7 @@ async fn try_download_file_segmented(
         file_id: remote_file.file_id.clone(),
         expected,
         key_used: options.key.is_some(),
+        validator: segment_resume.validator.clone(),
         timeout: options.timeout,
         progress: progress.clone(),
         shared_segments: Arc::clone(&shared_segments),
@@ -1256,32 +1584,24 @@ async fn try_download_file_segmented(
         &remote_file.file_id,
         expected,
         options.key.is_some(),
+        segment_resume.validator.as_ref(),
         &final_segments,
     )
-    .await
     .map_err(SegmentDownloadError::Failed)?;
 
-    let file = OpenOptions::new()
-        .write(true)
-        .open(&segment_resume.part_path)
-        .await
-        .map_err(|source| {
-            SegmentDownloadError::Failed(io_error(source, &segment_resume.part_path, IoOp::Write))
-        })?;
-    file.sync_all().await.map_err(|source| {
-        SegmentDownloadError::Failed(io_error(source, &segment_resume.part_path, IoOp::Write))
-    })?;
-
+    let replace_existing = batch_targets
+        .may_replace_existing(final_path, options.force)
+        .map_err(SegmentDownloadError::Failed)?;
     promote_part(
         &segment_resume.part_path,
         &segment_resume.sidecar_path,
         final_path,
-        options.force,
+        replace_existing,
     )
     .await
     .map_err(SegmentDownloadError::Failed)?;
 
-    info!("downloaded {} bytes to {}", expected, final_path.display());
+    info!(bytes = expected, path = ?final_path, "download complete");
 
     Ok(SingleDownloadOutcome {
         name: header_name,
@@ -1307,7 +1627,6 @@ fn pending_segment_work(
     pending.push_back(SegmentWork {
         index: initial.index,
         attempt: 0,
-        delay: None,
         initial: Some(InitialSegmentWork {
             range_start: initial.range_start,
             response: initial.response,
@@ -1320,7 +1639,6 @@ fn pending_segment_work(
         pending.push_back(SegmentWork {
             index,
             attempt: 0,
-            delay: None,
             initial: None,
         });
     }
@@ -1334,6 +1652,7 @@ async fn run_segment_scheduler(
     initial_limit: usize,
 ) -> Option<SegmentDownloadError> {
     let mut active = FuturesUnordered::new();
+    let mut delayed = VecDeque::<ScheduledSegmentWork>::new();
     let mut active_limit = initial_limit;
     let mut first_error = None;
     let mut consecutive_successes = 0_usize;
@@ -1343,6 +1662,14 @@ async fn run_segment_scheduler(
     }
 
     loop {
+        let now = tokio::time::Instant::now();
+        while delayed.front().is_some_and(|work| work.ready_at <= now) {
+            let scheduled = delayed
+                .pop_front()
+                .expect("front was checked before popping delayed work");
+            pending.push_back(scheduled.work);
+        }
+
         while active.len() < active_limit {
             let Some(work) = pending.pop_front() else {
                 break;
@@ -1352,10 +1679,26 @@ async fn run_segment_scheduler(
         }
 
         if active.is_empty() {
-            break;
+            let Some(next_retry) = delayed.front() else {
+                break;
+            };
+            tokio::time::sleep_until(next_retry.ready_at).await;
+            continue;
         }
 
-        let Some(work_result) = active.next().await else {
+        let next_result = if active.len() < active_limit {
+            if let Some(next_retry) = delayed.front() {
+                tokio::select! {
+                    result = active.next() => result,
+                    () = tokio::time::sleep_until(next_retry.ready_at) => continue,
+                }
+            } else {
+                active.next().await
+            }
+        } else {
+            active.next().await
+        };
+        let Some(work_result) = next_result else {
             break;
         };
         match work_result.result {
@@ -1384,15 +1727,18 @@ async fn run_segment_scheduler(
                     active_limit = (active_limit / 2).max(MIN_ADAPTIVE_SEGMENT_WORKERS);
                 }
                 mark_segment_waiting(&context, work_result.index);
-                active.push(run_segment_work(
-                    context.clone(),
-                    SegmentWork {
-                        index: work_result.index,
-                        attempt: work_result.attempt + 1,
-                        delay: Some(http::retry_delay(work_result.attempt)),
-                        initial: None,
+                schedule_segment_work(
+                    &mut delayed,
+                    ScheduledSegmentWork {
+                        ready_at: tokio::time::Instant::now()
+                            + http::retry_delay(work_result.attempt),
+                        work: SegmentWork {
+                            index: work_result.index,
+                            attempt: work_result.attempt + 1,
+                            initial: None,
+                        },
                     },
-                ));
+                );
             }
             Err(error) => {
                 consecutive_successes = 0;
@@ -1406,11 +1752,15 @@ async fn run_segment_scheduler(
     first_error
 }
 
+fn schedule_segment_work(delayed: &mut VecDeque<ScheduledSegmentWork>, work: ScheduledSegmentWork) {
+    let position = delayed
+        .iter()
+        .position(|queued| queued.ready_at > work.ready_at)
+        .unwrap_or(delayed.len());
+    delayed.insert(position, work);
+}
+
 async fn run_segment_work(context: SegmentContext, work: SegmentWork) -> SegmentWorkResult {
-    if let Some(delay) = work.delay {
-        mark_segment_waiting(&context, work.index);
-        tokio::time::sleep(delay).await;
-    }
     mark_segment_active(&context, work.index);
     let result = match work.initial {
         Some(initial) => {
@@ -1446,6 +1796,12 @@ async fn try_download_segment(
         segment_at(&context.shared_segments, index).map_err(SegmentDownloadError::Failed)?;
     let segment_len = segment_len(&segment);
     let already_downloaded = segment.downloaded.min(segment_len);
+    // A failed attempt may have written bytes after the last durable
+    // checkpoint. The retry overwrites that range, so reset the visible count
+    // instead of counting those bytes twice.
+    context
+        .progress
+        .set_segment_position(index, already_downloaded);
     if segment.done || already_downloaded == segment_len {
         update_segment_sidecar_sync(context, index, segment_len, true)
             .map_err(SegmentDownloadError::Failed)?;
@@ -1484,6 +1840,11 @@ async fn consume_segment_response(
             response.status().as_u16()
         )));
     }
+    if !validator_matches_headers(context.validator.as_ref(), response.headers()) {
+        return Err(SegmentDownloadError::Fallback(
+            "segment response validator changed".to_owned(),
+        ));
+    }
 
     let content_range = parse_content_range(response.headers()).map_err(|error| {
         SegmentDownloadError::Fallback(format!(
@@ -1503,18 +1864,16 @@ async fn consume_segment_response(
             content_range.end, segment.end
         )));
     }
-    if let Some(total) = content_range.total {
-        if total != context.expected {
-            return Err(SegmentDownloadError::Fallback(format!(
-                "Content-Range total is {total}, expected {}",
-                context.expected
-            )));
-        }
+    if let Some(total) = content_range.total
+        && total != context.expected
+    {
+        return Err(SegmentDownloadError::Fallback(format!(
+            "Content-Range total is {total}, expected {}",
+            context.expected
+        )));
     }
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(&context.part_path)
+    let mut file = open_part_file(&context.part_path, PartOpenMode::WriteExisting)
         .await
         .map_err(|source| {
             SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
@@ -1526,6 +1885,7 @@ async fn consume_segment_response(
         })?;
 
     let mut downloaded = already_downloaded;
+    let mut persisted_downloaded = already_downloaded;
     loop {
         let chunk = match next_chunk(&mut response, context.timeout).await {
             Ok(Some(chunk)) => chunk,
@@ -1553,8 +1913,14 @@ async fn consume_segment_response(
         })?;
         downloaded += chunk.len() as u64;
         context.progress.inc(index, chunk.len() as u64);
-        update_segment_sidecar_sync(context, index, downloaded, false)
-            .map_err(SegmentDownloadError::Failed)?;
+        if downloaded.saturating_sub(persisted_downloaded) >= SEGMENT_CHECKPOINT_BYTES {
+            file.sync_data().await.map_err(|source| {
+                SegmentDownloadError::Failed(io_error(source, &context.part_path, IoOp::Write))
+            })?;
+            update_segment_sidecar_sync(context, index, downloaded, false)
+                .map_err(SegmentDownloadError::Failed)?;
+            persisted_downloaded = downloaded;
+        }
     }
 
     if downloaded != segment_len {
@@ -1581,6 +1947,7 @@ async fn send_segment_request(
         &context.download_url,
         start,
         end,
+        context.validator.as_ref(),
         context.timeout,
     )
     .await
@@ -1592,11 +1959,15 @@ async fn send_range_request(
     download_url: &str,
     start: u64,
     end: u64,
+    validator: Option<&HttpValidator>,
     timeout: Duration,
 ) -> Result<reqwest::Response, GfileError> {
-    let request = client
+    let mut request = client
         .get(download_url)
         .header(header::RANGE, format!("bytes={start}-{end}"));
+    if let Some(validator) = validator {
+        request = request.header(header::IF_RANGE, validator_header_value(validator));
+    }
     let result = tokio::time::timeout(timeout, request.send())
         .await
         .map_err(|_| timeout_network_error("starting download segment"))?;
@@ -1616,14 +1987,11 @@ async fn load_existing_segmented_resume(
     }
 
     if !part_path.exists() {
-        debug!(
-            path = %part_path.display(),
-            "looked for existing segmented .part, not found"
-        );
+        debug!(path = ?part_path, "looked for existing segmented .part, not found");
         return Ok(None);
     }
 
-    let sidecar = match fs::read(&sidecar_path).await {
+    let sidecar = match read_sidecar_limited(&sidecar_path) {
         Ok(bytes) => parse_segment_sidecar(&bytes),
         Err(_) => None,
     };
@@ -1637,10 +2005,26 @@ async fn load_existing_segmented_resume(
     if sidecar.version != 2
         || sidecar.file_id != remote_file.file_id
         || sidecar.key_used != options.key.is_some()
-        || !normalize_segments(&mut sidecar.segments)
+        || sidecar
+            .validator
+            .as_ref()
+            .is_none_or(|validator| !validator_is_valid(validator))
+        || !normalize_segments(sidecar.expected, &mut sidecar.segments)
     {
         warn!(
             "existing .part sidecar cannot be used for this segmented download; restarting from zero. {THREADS_RESUME_HINT}"
+        );
+        return Ok(None);
+    }
+
+    let part_len = fs::metadata(&part_path)
+        .await
+        .map_err(|source| io_error(source, &part_path, IoOp::Metadata))?
+        .len();
+    if part_len != sidecar.expected {
+        warn!(
+            "existing segmented .part length is {part_len}, expected {}; restarting from zero. {THREADS_RESUME_HINT}",
+            sidecar.expected
         );
         return Ok(None);
     }
@@ -1653,6 +2037,7 @@ async fn load_existing_segmented_resume(
         part_path,
         sidecar_path,
         expected: sidecar.expected,
+        validator: sidecar.validator,
         segments: sidecar.segments,
         resumed,
     }))
@@ -1718,9 +2103,24 @@ fn parse_segment_sidecar(bytes: &[u8]) -> Option<SegmentSidecar> {
     serde_json::from_value(value).ok()
 }
 
-fn normalize_segments(segments: &mut [SegmentState]) -> bool {
+fn normalize_segments(expected: u64, segments: &mut [SegmentState]) -> bool {
+    if expected == 0 || segments.is_empty() || segments.len() > usize::from(MAX_DOWNLOAD_THREADS) {
+        return false;
+    }
+
+    let mut expected_start = 0;
     for segment in segments {
-        let len = segment_len(segment);
+        if segment.start != expected_start || segment.end < segment.start || segment.end >= expected
+        {
+            return false;
+        }
+        let Some(len) = segment
+            .end
+            .checked_sub(segment.start)
+            .and_then(|len| len.checked_add(1))
+        else {
+            return false;
+        };
         if segment.downloaded > len {
             return false;
         }
@@ -1729,8 +2129,12 @@ fn normalize_segments(segments: &mut [SegmentState]) -> bool {
         } else if segment.downloaded == len {
             segment.done = true;
         }
+        expected_start = match segment.end.checked_add(1) {
+            Some(start) => start,
+            None => return false,
+        };
     }
-    true
+    expected_start == expected
 }
 
 fn segment_at(
@@ -1776,41 +2180,27 @@ fn update_segment_sidecar_sync(
         &context.file_id,
         context.expected,
         context.key_used,
+        context.validator.as_ref(),
         &segments,
     )?;
-    // Atomic replace: this file is rewritten after every chunk while other
-    // code (the interrupt summary, a resume check) may read it at any moment;
+    // Atomic replace: other code (the interrupt summary or a resume check) may
+    // read the checkpoint at any moment;
     // a plain truncate-and-write leaves it unparsable for most of its life.
     // Writers are serialized by the shared_segments lock held above.
-    let tmp_path = sidecar_tmp_path(&context.sidecar_path);
-    std::fs::write(&tmp_path, bytes).map_err(|source| io_error(source, &tmp_path, IoOp::Write))?;
-    std::fs::rename(&tmp_path, &context.sidecar_path)
+    fsutil::write_atomic(&context.sidecar_path, &bytes)
         .map_err(|source| io_error(source, &context.sidecar_path, IoOp::Write))
 }
 
-fn sidecar_tmp_path(sidecar_path: &Path) -> PathBuf {
-    let mut name = sidecar_path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_default();
-    name.push(".tmp");
-    sidecar_path.with_file_name(name)
-}
-
-async fn write_segment_sidecar(
+fn write_segment_sidecar(
     sidecar_path: &Path,
     file_id: &str,
     expected: u64,
     key_used: bool,
+    validator: Option<&HttpValidator>,
     segments: &[SegmentState],
 ) -> Result<(), GfileError> {
-    let sidecar_bytes = segment_sidecar_bytes(file_id, expected, key_used, segments)?;
-    let tmp_path = sidecar_tmp_path(sidecar_path);
-    fs::write(&tmp_path, sidecar_bytes)
-        .await
-        .map_err(|source| io_error(source, &tmp_path, IoOp::Write))?;
-    fs::rename(&tmp_path, sidecar_path)
-        .await
+    let sidecar_bytes = segment_sidecar_bytes(file_id, expected, key_used, validator, segments)?;
+    fsutil::write_atomic(sidecar_path, &sidecar_bytes)
         .map_err(|source| io_error(source, sidecar_path, IoOp::Write))
 }
 
@@ -1818,6 +2208,7 @@ fn segment_sidecar_bytes(
     file_id: &str,
     expected: u64,
     key_used: bool,
+    validator: Option<&HttpValidator>,
     segments: &[SegmentState],
 ) -> Result<Vec<u8>, GfileError> {
     let sidecar = SegmentSidecar {
@@ -1825,6 +2216,7 @@ fn segment_sidecar_bytes(
         file_id: file_id.to_owned(),
         expected,
         key_used,
+        validator: validator.cloned(),
         segments: segments.to_vec(),
     };
     serde_json::to_vec(&sidecar).map_err(|source| {
@@ -1844,20 +2236,201 @@ fn segment_completed_bytes(segment: &SegmentState) -> u64 {
     }
 }
 
+async fn restart_sequential_if_validator_mismatch(
+    client: &reqwest::Client,
+    download_url: &str,
+    response: &mut reqwest::Response,
+    resume: &mut ResumePlan,
+    options: &DownloadOptions,
+) -> Result<(), GfileError> {
+    if response.status() != StatusCode::PARTIAL_CONTENT
+        || resume.range_start.is_none()
+        || validator_matches_headers(resume.validator.as_ref(), response.headers())
+    {
+        return Ok(());
+    }
+
+    warn!("resume response validator changed; discarding partial data and restarting from zero");
+    remove_if_exists(&resume.part_path).await?;
+    remove_if_exists(&resume.sidecar_path).await?;
+    resume.range_start = None;
+    resume.expected = None;
+    resume.validator = None;
+    *response = send_download_request(client, download_url, None, None, options).await?;
+    Ok(())
+}
+
 async fn send_download_request(
     client: &reqwest::Client,
     download_url: &str,
     range_start: Option<u64>,
+    validator: Option<&HttpValidator>,
     options: &DownloadOptions,
 ) -> Result<reqwest::Response, GfileError> {
     let mut request = client.get(download_url);
     if let Some(start) = range_start {
         request = request.header(header::RANGE, format!("bytes={start}-"));
+        if let Some(validator) = validator {
+            request = request.header(header::IF_RANGE, validator_header_value(validator));
+        }
     }
     let result = tokio::time::timeout(options.timeout, request.send())
         .await
         .map_err(|_| timeout_network_error("starting file download"))?;
     result.map_err(|source| network_error(source, "starting file download"))
+}
+
+async fn open_part_file(path: &Path, mode: PartOpenMode) -> io::Result<File> {
+    let before = match fs::symlink_metadata(path).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let mut options = OpenOptions::new();
+    match mode {
+        PartOpenMode::CreateOrTruncate if before.is_none() => {
+            options.write(true).create_new(true);
+        }
+        PartOpenMode::CreateOrTruncate => {
+            // Do not request O_TRUNC here. The path may be swapped between
+            // symlink_metadata and open; truncating during open would damage
+            // the replacement before its identity can be rejected below.
+            options.write(true);
+        }
+        PartOpenMode::AppendExisting => {
+            options.append(true);
+        }
+        PartOpenMode::WriteExisting => {
+            options.write(true);
+        }
+    }
+    configure_no_follow(&mut options);
+    let file = options.open(path).await?;
+    let opened = file.metadata().await?;
+    if !is_safe_part_metadata(&opened) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial-download path is not a regular non-reparse file",
+        ));
+    }
+
+    let after = fs::symlink_metadata(path).await?;
+    if !is_safe_part_metadata(&after) || !same_file_identity(&opened, &after) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial-download path changed while it was opened",
+        ));
+    }
+    if let Some(before) = before.as_ref()
+        && (!is_safe_part_metadata(before) || !same_file_identity(before, &opened))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial-download path changed before it was opened",
+        ));
+    }
+    if matches!(mode, PartOpenMode::CreateOrTruncate) {
+        // Truncate only the validated handle. A later path replacement cannot
+        // redirect this operation to another file.
+        file.set_len(0).await?;
+    }
+    Ok(file)
+}
+
+fn configure_no_follow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+fn is_safe_part_metadata(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return false;
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x400 != 0 {
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    // Windows opens with FILE_FLAG_OPEN_REPARSE_POINT and rejects every
+    // reparse-point handle above. Stable std does not expose file-index
+    // identity, so the handle-level reparse check is the portable guarantee.
+    true
+}
+
+fn validator_from_headers(headers: &header::HeaderMap) -> Option<HttpValidator> {
+    strong_etag_from_headers(headers)
+        .map(HttpValidator::StrongEtag)
+        .or_else(|| last_modified_from_headers(headers).map(HttpValidator::LastModified))
+}
+
+fn validator_matches_headers(
+    expected: Option<&HttpValidator>,
+    headers: &header::HeaderMap,
+) -> bool {
+    match expected {
+        Some(HttpValidator::StrongEtag(expected)) => {
+            strong_etag_from_headers(headers).as_deref() == Some(expected)
+        }
+        Some(HttpValidator::LastModified(expected)) => {
+            last_modified_from_headers(headers).as_deref() == Some(expected)
+        }
+        None => validator_from_headers(headers).is_none(),
+    }
+}
+
+fn strong_etag_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    let value = headers.get(header::ETAG)?.to_str().ok()?.trim();
+    valid_strong_etag(value).then(|| value.to_owned())
+}
+
+fn last_modified_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    let value = headers.get(header::LAST_MODIFIED)?.to_str().ok()?.trim();
+    valid_last_modified(value).then(|| value.to_owned())
+}
+
+fn validator_header_value(validator: &HttpValidator) -> &str {
+    match validator {
+        HttpValidator::StrongEtag(value) | HttpValidator::LastModified(value) => value,
+    }
+}
+
+fn validator_is_valid(validator: &HttpValidator) -> bool {
+    match validator {
+        HttpValidator::StrongEtag(value) => valid_strong_etag(value),
+        HttpValidator::LastModified(value) => valid_last_modified(value),
+    }
+}
+
+fn valid_strong_etag(value: &str) -> bool {
+    value.trim() == value
+        && value.len() >= 2
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && !value
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("w/"))
+        && value.parse::<header::HeaderValue>().is_ok()
+}
+
+fn valid_last_modified(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && value.parse::<header::HeaderValue>().is_ok()
 }
 
 async fn prepare_resume(
@@ -1872,10 +2445,11 @@ async fn prepare_resume(
             sidecar_path,
             range_start: None,
             expected: None,
+            validator: None,
         });
     }
 
-    let sidecar = match fs::read(&sidecar_path).await {
+    let sidecar = match read_sidecar_limited(&sidecar_path) {
         Ok(bytes) => serde_json::from_slice::<PartSidecar>(&bytes).ok(),
         Err(_) => None,
     };
@@ -1888,10 +2462,18 @@ async fn prepare_resume(
             sidecar_path,
             range_start: None,
             expected: None,
+            validator: None,
         });
     };
 
-    if sidecar.version != 1 || sidecar.file_id != remote_file.file_id || sidecar.expected.is_none()
+    if sidecar.version != 1
+        || sidecar.file_id != remote_file.file_id
+        || sidecar.expected.is_none()
+        || sidecar.key_used != options.key.is_some()
+        || sidecar
+            .validator
+            .as_ref()
+            .is_none_or(|validator| !validator_is_valid(validator))
     {
         warn!(
             "existing .part sidecar does not match this file; restarting from zero. {THREADS_RESUME_HINT}"
@@ -1901,6 +2483,7 @@ async fn prepare_resume(
             sidecar_path,
             range_start: None,
             expected: None,
+            validator: None,
         });
     }
 
@@ -1914,6 +2497,7 @@ async fn prepare_resume(
             sidecar_path,
             range_start: None,
             expected: sidecar.expected,
+            validator: None,
         });
     }
 
@@ -1922,6 +2506,7 @@ async fn prepare_resume(
         sidecar_path,
         range_start: Some(len),
         expected: sidecar.expected,
+        validator: sidecar.validator,
     })
 }
 
@@ -1970,21 +2555,25 @@ fn transfer_plan(
 }
 
 async fn complete_if_range_already_finished(
+    response: &reqwest::Response,
     resume: &ResumePlan,
     final_path: &Path,
-    options: &DownloadOptions,
+    replace_existing: bool,
 ) -> Result<Option<SingleDownloadOutcome>, GfileError> {
     let Some(start) = resume.range_start else {
         return Ok(None);
     };
-    if resume.expected != Some(start) {
+    if resume.expected != Some(start)
+        || unsatisfied_content_range_total(response.headers()) != Some(start)
+        || !validator_matches_headers(resume.validator.as_ref(), response.headers())
+    {
         return Ok(None);
     }
     promote_part(
         &resume.part_path,
         &resume.sidecar_path,
         final_path,
-        options.force,
+        replace_existing,
     )
     .await?;
     Ok(Some(SingleDownloadOutcome {
@@ -1996,22 +2585,23 @@ async fn complete_if_range_already_finished(
     }))
 }
 
-async fn write_sidecar(
+fn write_sidecar(
     sidecar_path: &Path,
     remote_file: &RemoteFile,
     expected: Option<u64>,
     key_used: bool,
+    validator: Option<HttpValidator>,
 ) -> Result<(), GfileError> {
     let sidecar = PartSidecar {
         version: 1,
         file_id: remote_file.file_id.clone(),
         expected,
         key_used,
+        validator,
     };
     let sidecar_bytes = serde_json::to_vec(&sidecar)
         .map_err(|source| internal_error(format!("failed to serialize sidecar: {source}")))?;
-    fs::write(sidecar_path, sidecar_bytes)
-        .await
+    fsutil::write_atomic(sidecar_path, &sidecar_bytes)
         .map_err(|source| io_error(source, sidecar_path, IoOp::Write))
 }
 
@@ -2026,10 +2616,20 @@ async fn write_sidecar(
 /// a barely-started segmented download.
 pub(crate) fn bytes_completed_on_disk(part_path: &Path, sidecar_path: &Path) -> Option<u64> {
     for attempt in 0..3 {
-        match std::fs::read(sidecar_path) {
+        match read_sidecar_limited(sidecar_path) {
             Ok(bytes) => {
-                if let Some(sidecar) = parse_segment_sidecar(&bytes) {
-                    return Some(sidecar.segments.iter().map(segment_completed_bytes).sum());
+                if let Some(mut sidecar) = parse_segment_sidecar(&bytes) {
+                    if std::fs::metadata(part_path).ok()?.len() != sidecar.expected
+                        || !normalize_segments(sidecar.expected, &mut sidecar.segments)
+                    {
+                        return None;
+                    }
+                    return sidecar
+                        .segments
+                        .iter()
+                        .try_fold(0_u64, |completed, segment| {
+                            completed.checked_add(segment_completed_bytes(segment))
+                        });
                 }
                 let version = serde_json::from_slice::<serde_json::Value>(&bytes)
                     .ok()
@@ -2054,23 +2654,91 @@ pub(crate) fn bytes_completed_on_disk(part_path: &Path, sidecar_path: &Path) -> 
     None
 }
 
+pub(crate) fn read_sidecar_limited(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_SIDECAR_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial-download sidecar is too large or is not a regular file",
+        ));
+    }
+    let file = StdFile::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SIDECAR_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "partial-download sidecar exceeds the size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 async fn promote_part(
     part_path: &Path,
     sidecar_path: &Path,
     final_path: &Path,
     force: bool,
 ) -> Result<(), GfileError> {
-    crate::interrupt::set_active_download(None);
-    if final_path.exists() && force {
-        fs::remove_file(final_path)
-            .await
+    // Every completion path, including a resumed HTTP 416 or an already
+    // complete segmented sidecar, passes through this validation and sync.
+    let part_file = open_part_file(part_path, PartOpenMode::WriteExisting)
+        .await
+        .map_err(|source| io_error(source, part_path, IoOp::Write))?;
+    part_file
+        .sync_all()
+        .await
+        .map_err(|source| io_error(source, part_path, IoOp::Write))?;
+    drop(part_file);
+
+    if force {
+        // Both paths are created in the same directory, so replacement is an
+        // atomic replacement on the supported platforms. Keeping the old
+        // target in place until this succeeds preserves it on I/O failure.
+        fsutil::replace_file(part_path, final_path)
             .map_err(|source| io_error(source, final_path, IoOp::Rename))?;
+    } else {
+        fsutil::move_file_noreplace(part_path, final_path).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                GfileError::TargetExists {
+                    path: final_path.to_owned(),
+                }
+            } else {
+                io_error(source, final_path, IoOp::Rename)
+            }
+        })?;
     }
 
-    remove_if_exists(sidecar_path).await?;
-    fs::rename(part_path, final_path)
-        .await
-        .map_err(|source| io_error(source, final_path, IoOp::Rename))
+    if let Err(error) = remove_if_exists(sidecar_path).await {
+        warn!(
+            path = ?sidecar_path,
+            error = %error.user_message(),
+            "download committed but partial-download sidecar cleanup failed"
+        );
+    }
+    if let Err(source) = sync_parent_directory(final_path) {
+        warn!(
+            path = ?final_path,
+            %source,
+            "download committed but syncing the target directory failed"
+        );
+    }
+    crate::interrupt::set_active_download(None);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    StdFile::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 async fn remove_if_exists(path: &Path) -> Result<(), GfileError> {
@@ -2084,9 +2752,9 @@ async fn remove_if_exists(path: &Path) -> Result<(), GfileError> {
 async fn next_chunk(
     response: &mut reqwest::Response,
     timeout: Duration,
-) -> Result<Option<Vec<u8>>, ChunkReadError> {
+) -> Result<Option<Bytes>, ChunkReadError> {
     match tokio::time::timeout(timeout, response.chunk()).await {
-        Ok(Ok(Some(chunk))) => Ok(Some(chunk.to_vec())),
+        Ok(Ok(Some(chunk))) => Ok(Some(chunk)),
         Ok(Err(source)) => Err(ChunkReadError::Http(source)),
         Ok(Ok(None)) => Ok(None),
         Err(_) => Err(ChunkReadError::Timeout),
@@ -2128,26 +2796,30 @@ fn validate_output_for_page(page: &PageInfo, output: Option<&Path>) -> Result<()
     if page.kind != PageKind::Matomete {
         return Ok(());
     }
-    if let Some(path) = output {
-        if !(path.exists() && path.is_dir()) {
-            return Err(GfileError::Usage {
-                message: format!(
-                    "matomete downloads require --output to be an existing directory, got {}",
-                    path.display()
-                ),
-            });
-        }
+    if let Some(path) = output
+        && !(path.exists() && path.is_dir())
+    {
+        return Err(GfileError::Usage {
+            message: format!(
+                "matomete downloads require --output to be an existing directory, got {}",
+                path.display()
+            ),
+        });
     }
     Ok(())
 }
 
-fn ensure_target_available(final_path: &Path, force: bool) -> Result<(), GfileError> {
+fn ensure_unclaimed_target_available(final_path: &Path, force: bool) -> Result<(), GfileError> {
     if final_path.exists() && !force {
-        return Err(GfileError::TargetExists {
-            path: final_path.to_owned(),
-        });
+        return Err(target_exists(final_path));
     }
     Ok(())
+}
+
+fn target_exists(path: &Path) -> GfileError {
+    GfileError::TargetExists {
+        path: path.to_owned(),
+    }
 }
 
 fn part_paths(final_path: &Path) -> Result<(PathBuf, PathBuf), GfileError> {
@@ -2158,8 +2830,10 @@ fn part_paths(final_path: &Path) -> Result<(PathBuf, PathBuf), GfileError> {
             IoOp::Create,
         )
     })?;
-    let part_name = format!("{}.part", file_name.to_string_lossy());
-    let sidecar_name = format!("{part_name}.json");
+    let mut part_name = file_name.to_os_string();
+    part_name.push(".part");
+    let mut sidecar_name = part_name.clone();
+    sidecar_name.push(".json");
 
     let mut part = final_path.to_owned();
     part.set_file_name(part_name);
@@ -2177,7 +2851,9 @@ fn lock_path_for_sidecar(sidecar_path: &Path) -> Result<PathBuf, GfileError> {
         )
     })?;
     let mut lock_path = sidecar_path.to_owned();
-    lock_path.set_file_name(format!("{}.lock", file_name.to_string_lossy()));
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    lock_path.set_file_name(lock_name);
     Ok(lock_path)
 }
 
@@ -2198,6 +2874,7 @@ fn fresh_resume_plan(final_path: &Path) -> Result<ResumePlan, GfileError> {
         sidecar_path,
         range_start: None,
         expected: None,
+        validator: None,
     })
 }
 
@@ -2207,8 +2884,8 @@ fn fresh_resume_plan(final_path: &Path) -> Result<ResumePlan, GfileError> {
 fn progress_label(target_path: &Path, fallback: &str) -> String {
     target_path
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fallback.to_owned())
+        .map(|name| escape_terminal_text(&name.to_string_lossy()).into_owned())
+        .unwrap_or_else(|| escape_terminal_text(fallback).into_owned())
 }
 
 fn header_filename_output_dir(
@@ -2239,12 +2916,15 @@ fn parse_content_range(headers: &header::HeaderMap) -> Result<ContentRange, Gfil
             what: "206 response missing Content-Range".to_owned(),
             hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
         })?;
-    let re =
-        Regex::new(r"^bytes +(\d+)-(\d+)/(\d+|\*)$").expect("valid Content-Range parser regex");
-    let captures = re.captures(value).ok_or_else(|| GfileError::Parse {
-        what: format!("invalid Content-Range header {value:?}"),
-        hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
-    })?;
+    static CONTENT_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^bytes +(\d+)-(\d+)/(\d+|\*)$").expect("valid Content-Range parser regex")
+    });
+    let captures = CONTENT_RANGE_RE
+        .captures(value)
+        .ok_or_else(|| GfileError::Parse {
+            what: format!("invalid Content-Range header {value:?}"),
+            hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
+        })?;
     let start = captures[1].parse::<u64>().map_err(|_| GfileError::Parse {
         what: format!("invalid Content-Range start in {value:?}"),
         hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
@@ -2261,7 +2941,21 @@ fn parse_content_range(headers: &header::HeaderMap) -> Result<ContentRange, Gfil
             hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
         })?)
     };
+    if end < start || total.is_some_and(|total| total == 0 || end >= total) {
+        return Err(GfileError::Parse {
+            what: format!("inconsistent Content-Range header {value:?}"),
+            hint: "Retry with --no-resume; if it repeats, report the response headers.".to_owned(),
+        });
+    }
     Ok(ContentRange { start, end, total })
+}
+
+fn unsatisfied_content_range_total(headers: &header::HeaderMap) -> Option<u64> {
+    let value = headers.get(header::CONTENT_RANGE)?.to_str().ok()?.trim();
+    static CONTENT_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^bytes +\*/(\d+)$").expect("valid unsatisfied Content-Range parser regex")
+    });
+    CONTENT_RANGE_RE.captures(value)?[1].parse().ok()
 }
 
 fn is_html_content_type(headers: &header::HeaderMap) -> bool {
@@ -2278,27 +2972,85 @@ fn content_type_is_missing(headers: &header::HeaderMap) -> bool {
 fn content_disposition_filename(headers: &header::HeaderMap) -> Option<String> {
     let value = headers.get(header::CONTENT_DISPOSITION)?;
     let value = String::from_utf8_lossy(value.as_bytes());
-    for part in value.split(';').map(str::trim) {
-        if let Some(encoded) = part.strip_prefix("filename*=") {
-            let encoded = encoded.trim_matches('"');
-            let encoded = encoded
-                .strip_prefix("UTF-8''")
-                .or_else(|| encoded.strip_prefix("utf-8''"))
-                .unwrap_or(encoded);
-            if let Some(decoded) = percent_decode_utf8(encoded) {
-                return Some(decoded);
+    let mut fallback = None;
+    for part in split_header_parameters(&value) {
+        let Some((name, raw_value)) = part.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("filename*") {
+            if let Some(filename) = decode_extended_filename(raw_value) {
+                return Some(filename);
+            }
+        } else if fallback.is_none() && name.trim().eq_ignore_ascii_case("filename") {
+            let filename = unquote_header_value(raw_value);
+            if !filename.trim().is_empty() {
+                fallback = Some(filename);
             }
         }
     }
-    for part in value.split(';').map(str::trim) {
-        if let Some(filename) = part.strip_prefix("filename=") {
-            let filename = filename.trim_matches('"').trim();
-            if !filename.is_empty() {
-                return Some(filename.to_owned());
+    fallback
+}
+
+fn split_header_parameters(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(value[start..index].trim());
+                start = index + ch.len_utf8();
             }
+            _ => {}
         }
     }
-    None
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn decode_extended_filename(value: &str) -> Option<String> {
+    let value = unquote_header_value(value);
+    let mut pieces = value.splitn(3, '\'');
+    let charset = pieces.next()?;
+    let _language = pieces.next()?;
+    let encoded = pieces.next()?;
+    if !charset.eq_ignore_ascii_case("utf-8") {
+        return None;
+    }
+    percent_decode_utf8(encoded).filter(|filename| !filename.trim().is_empty())
+}
+
+fn unquote_header_value(value: &str) -> String {
+    let value = value.trim();
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return value.to_owned();
+    };
+    let mut output = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            output.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            output.push(ch);
+        }
+    }
+    if escaped {
+        output.push('\\');
+    }
+    output
 }
 
 fn percent_decode_utf8(input: &str) -> Option<String> {
@@ -2387,8 +3139,9 @@ fn warn_on_display_size_mismatch(remote_file: &RemoteFile, expected: Option<u64>
         let tolerance = (approx / 10).max(1024);
         if approx.abs_diff(content_length) > tolerance {
             warn!(
-                "display size {} differs from Content-Length {} by more than tolerance",
-                display_size_text, content_length
+                display_size = ?display_size_text,
+                content_length,
+                "display size differs from Content-Length by more than tolerance"
             );
         }
     }
@@ -2434,6 +3187,30 @@ mod tests {
     #[test]
     fn progress_label_falls_back_to_page_name_without_file_name() {
         assert_eq!(progress_label(Path::new("/"), "******.mmts"), "******.mmts");
+    }
+
+    #[test]
+    fn content_disposition_supports_rfc5987_and_quoted_semicolons() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static(
+                "attachment; filename=plain.txt; FILENAME*=UTF-8'en'%E3%83%86%E3%82%B9%E3%83%88.txt",
+            ),
+        );
+        assert_eq!(
+            content_disposition_filename(&headers).as_deref(),
+            Some("テスト.txt")
+        );
+
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static("attachment; filename=\"a;b \\\"copy\\\".txt\""),
+        );
+        assert_eq!(
+            content_disposition_filename(&headers).as_deref(),
+            Some("a;b \"copy\".txt")
+        );
     }
 
     #[test]
@@ -2502,6 +3279,76 @@ mod tests {
     }
 
     #[test]
+    fn bytes_completed_on_disk_rejects_malformed_v2_layout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        std::fs::write(&part_path, vec![0_u8; 10]).unwrap();
+
+        for segments in [
+            serde_json::json!([
+                {"start": 5, "end": 4, "done": true, "downloaded": 0}
+            ]),
+            serde_json::json!([
+                {"start": 0, "end": 4, "done": true, "downloaded": 5},
+                {"start": 6, "end": 9, "done": false, "downloaded": 1}
+            ]),
+            serde_json::json!([
+                {"start": 0, "end": 9, "done": false, "downloaded": 11}
+            ]),
+        ] {
+            std::fs::write(
+                &sidecar_path,
+                serde_json::json!({
+                    "version": 2,
+                    "file_id": "0123abcd-000000example",
+                    "expected": 10,
+                    "key_used": false,
+                    "segments": segments,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            assert_eq!(bytes_completed_on_disk(&part_path, &sidecar_path), None);
+        }
+    }
+
+    #[test]
+    fn bytes_completed_on_disk_rejects_v2_part_length_mismatch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        std::fs::write(&part_path, vec![0_u8; 9]).unwrap();
+        std::fs::write(
+            &sidecar_path,
+            serde_json::json!({
+                "version": 2,
+                "file_id": "0123abcd-000000example",
+                "expected": 10,
+                "key_used": false,
+                "segments": [
+                    {"start": 0, "end": 9, "done": false, "downloaded": 5}
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(bytes_completed_on_disk(&part_path, &sidecar_path), None);
+    }
+
+    #[test]
+    fn oversized_sidecar_is_rejected_before_reading_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        let file = std::fs::File::create(&sidecar_path).unwrap();
+        file.set_len(MAX_SIDECAR_BYTES + 1).unwrap();
+
+        assert!(read_sidecar_limited(&sidecar_path).is_err());
+    }
+
+    #[test]
     fn bytes_completed_on_disk_uses_part_length_without_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let part_path = temp.path().join("file.bin.part");
@@ -2511,5 +3358,170 @@ mod tests {
             bytes_completed_on_disk(&part_path, &temp.path().join("file.bin.part.json")),
             Some(55)
         );
+    }
+
+    #[test]
+    fn segmented_sidecar_layout_must_cover_file_exactly() {
+        let mut valid = vec![
+            SegmentState {
+                start: 0,
+                end: 4,
+                done: false,
+                downloaded: 5,
+            },
+            SegmentState {
+                start: 5,
+                end: 9,
+                done: false,
+                downloaded: 2,
+            },
+        ];
+        assert!(normalize_segments(10, &mut valid));
+        assert!(valid[0].done);
+
+        for mut invalid in [
+            vec![SegmentState {
+                start: 1,
+                end: 9,
+                done: false,
+                downloaded: 0,
+            }],
+            vec![
+                SegmentState {
+                    start: 0,
+                    end: 4,
+                    done: false,
+                    downloaded: 0,
+                },
+                SegmentState {
+                    start: 6,
+                    end: 9,
+                    done: false,
+                    downloaded: 0,
+                },
+            ],
+            vec![SegmentState {
+                start: 0,
+                end: 10,
+                done: false,
+                downloaded: 0,
+            }],
+            vec![SegmentState {
+                start: 5,
+                end: 4,
+                done: false,
+                downloaded: 0,
+            }],
+        ] {
+            assert!(!normalize_segments(10, &mut invalid));
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_part_never_overwrites_late_target_without_force() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        let final_path = temp.path().join("file.bin");
+        std::fs::write(&part_path, b"downloaded").unwrap();
+        std::fs::write(&sidecar_path, b"sidecar").unwrap();
+        std::fs::write(&final_path, b"created while downloading").unwrap();
+
+        let error = promote_part(&part_path, &sidecar_path, &final_path, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GfileError::TargetExists { .. }));
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"created while downloading"
+        );
+        assert_eq!(std::fs::read(&part_path).unwrap(), b"downloaded");
+        assert!(sidecar_path.exists());
+    }
+
+    #[tokio::test]
+    async fn matomete_force_only_replaces_targets_present_before_batch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        let final_path = temp.path().join("file.bin");
+        let targets = BatchTargetRegistry::for_page(PageKind::Matomete, Some(temp.path())).unwrap();
+        targets.claim(&final_path, "first-file", true).unwrap();
+        targets
+            .check_available(&final_path, "first-file", true)
+            .unwrap();
+        let replace_existing = targets.may_replace_existing(&final_path, true).unwrap();
+        assert!(!replace_existing);
+
+        std::fs::write(&part_path, b"downloaded").unwrap();
+        std::fs::write(&sidecar_path, b"sidecar").unwrap();
+        std::fs::write(&final_path, b"created during batch").unwrap();
+
+        let error = promote_part(&part_path, &sidecar_path, &final_path, replace_existing)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GfileError::TargetExists { .. }));
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"created during batch");
+        assert_eq!(std::fs::read(&part_path).unwrap(), b"downloaded");
+    }
+
+    #[tokio::test]
+    async fn promote_part_reports_success_after_sidecar_cleanup_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        let final_path = temp.path().join("file.bin");
+        std::fs::write(&part_path, b"downloaded").unwrap();
+        std::fs::create_dir(&sidecar_path).unwrap();
+
+        promote_part(&part_path, &sidecar_path, &final_path, false)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"downloaded");
+        assert!(!part_path.exists());
+        assert!(sidecar_path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_directory_accepts_promoted_target_parent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("file.bin");
+        std::fs::write(&target, b"downloaded").unwrap();
+
+        sync_parent_directory(&target).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promote_part_refuses_symlink_without_touching_victim() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let victim_path = temp.path().join("victim.bin");
+        let part_path = temp.path().join("file.bin.part");
+        let sidecar_path = temp.path().join("file.bin.part.json");
+        let final_path = temp.path().join("file.bin");
+        std::fs::write(&victim_path, b"keep me").unwrap();
+        symlink(&victim_path, &part_path).unwrap();
+        std::fs::write(&sidecar_path, b"sidecar").unwrap();
+
+        let error = promote_part(&part_path, &sidecar_path, &final_path, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GfileError::Io { .. }));
+        assert_eq!(std::fs::read(&victim_path).unwrap(), b"keep me");
+        assert!(
+            std::fs::symlink_metadata(&part_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!final_path.exists());
+        assert!(sidecar_path.exists());
     }
 }

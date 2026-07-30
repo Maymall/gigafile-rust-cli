@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MIT
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 // gfile.py@4c45392 lines 21-37 use 1024 as the display-size unit divisor.
 const UNITS: &[&str] = &["B", "K", "M", "G", "T", "P", "E", "Z", "Y"];
 
 pub fn parse_display_size(input: &str) -> Option<u64> {
-    let re = Regex::new(r"(?i)^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPEZY]?)(?:I?B)?\s*$")
-        .expect("valid size regex");
-    let caps = re.captures(input)?;
+    static SIZE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPEZY]?)(?:I?B)?\s*$")
+            .expect("valid size regex")
+    });
+    let caps = SIZE_RE.captures(input)?;
     let number = caps.name("num")?.as_str().parse::<f64>().ok()?;
     let unit = caps
         .name("unit")

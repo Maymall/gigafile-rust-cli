@@ -28,17 +28,17 @@ async fn self_update_replaces_temp_copy_and_leaves_it_executable() {
         return;
     };
     let server = MockServer::start().await;
-    let tag = "v9.9.9";
-    let version = "9.9.9";
+    let version = env!("CARGO_PKG_VERSION");
+    let tag = format!("v{version}");
     let asset = archive_name(version, target);
     let source = cargo_bin_path();
     let mut updated_binary = fs::read(&source).unwrap();
     updated_binary.extend_from_slice(b"\nRGFILE-SELF-UPDATE-TEST\n");
     let archive = release_archive(version, target, &updated_binary);
 
-    mount_latest_release(&server, tag).await;
-    mount_asset(&server, tag, &asset, archive.clone()).await;
-    mount_asset(&server, tag, "SHA256SUMS", checksum_body(&asset, &archive)).await;
+    mount_latest_release(&server, &tag).await;
+    mount_asset(&server, &tag, &asset, archive.clone()).await;
+    mount_asset(&server, &tag, "SHA256SUMS", checksum_body(&asset, &archive)).await;
 
     let temp = TempDir::new().unwrap();
     let copy = temp.path().join("rgfile-copy");
@@ -61,6 +61,51 @@ async fn self_update_replaces_temp_copy_and_leaves_it_executable() {
     assert_ne!(mode & 0o111, 0);
 
     Command::new(&copy).arg("--version").assert().success();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn self_update_version_smoke_test_preserves_current_executable() {
+    let Some(target) = current_release_target() else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let tag = "v9.9.6";
+    let version = "9.9.6";
+    let asset = archive_name(version, target);
+    let source = cargo_bin_path();
+    let staged_binary = fs::read(&source).unwrap();
+    let archive = release_archive(version, target, &staged_binary);
+
+    mount_latest_release(&server, tag).await;
+    mount_asset(&server, tag, &asset, archive.clone()).await;
+    mount_asset(&server, tag, "SHA256SUMS", checksum_body(&asset, &archive)).await;
+
+    let temp = TempDir::new().unwrap();
+    let copy = temp.path().join("rgfile-copy");
+    fs::copy(&source, &copy).unwrap();
+    let mut permissions = fs::metadata(&copy).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&copy, permissions).unwrap();
+    let original = fs::read(&copy).unwrap();
+
+    Command::new(&copy)
+        .env("RGFILE_TEST_UPDATE_BASE_URL", server.uri())
+        .env("RGFILE_TEST_FORCE_UPDATE", "1")
+        .args(["--no-config", "self-update"])
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("self-update smoke test failed"))
+        .stderr(predicate::str::contains("expected version output"));
+
+    assert_eq!(fs::read(&copy).unwrap(), original);
+    assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rgfile-update-")
+    }));
 }
 
 #[tokio::test]
@@ -137,7 +182,9 @@ async fn self_update_missing_target_in_checksums_is_parse_error() {
         .args(["--no-config", "self-update"])
         .assert()
         .code(13)
-        .stderr(predicate::str::contains("SHA256SUMS has no entry"));
+        .stderr(predicate::str::contains(
+            "SHA256SUMS does not contain exactly one valid entry",
+        ));
 }
 
 async fn mount_latest_release(server: &MockServer, tag: &str) {

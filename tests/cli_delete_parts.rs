@@ -134,6 +134,48 @@ async fn cli_delete_uses_history_delete_key_and_records_delete() {
 }
 
 #[tokio::test]
+async fn cli_delete_explicit_credentials_ignore_corrupt_history() {
+    let server = MockServer::start().await;
+    mount_delete(&server, 0).await;
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    let history_path = data.join("rgfile").join("history.jsonl");
+    std::fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+    std::fs::write(&history_path, b"truncated {\n").unwrap();
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[history]\nenabled = true\nstore_delete_keys = true\n",
+    )
+    .unwrap();
+    let url = format!("{}/{FILE_ID}", server.uri());
+
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .env("RGFILE_TEST_DATA_DIR", &data)
+        .args(["--config"])
+        .arg(&config)
+        .args(["delete", "--yes", "--delkey", DELKEY, &url])
+        .assert()
+        .success();
+
+    let key_file = temp.path().join("delete-key.txt");
+    std::fs::write(&key_file, format!("{DELKEY}\n")).unwrap();
+    Command::cargo_bin("rgfile")
+        .unwrap()
+        .env("GFILE_TEST_ALLOW_ANY_HOST", "1")
+        .env("RGFILE_TEST_DATA_DIR", &data)
+        .args(["--config"])
+        .arg(&config)
+        .args(["delete", "--yes", "--delkey-file"])
+        .arg(&key_file)
+        .arg(&url)
+        .assert()
+        .success();
+}
+
+#[tokio::test]
 async fn cli_delete_verbose_retry_redacts_delkey() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));

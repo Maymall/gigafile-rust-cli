@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::error::GfileError;
 
@@ -9,8 +10,9 @@ use crate::error::GfileError;
 const SERVER_ASSIGNMENT_RE: &str = r#"var\s+server\s*=\s*"([^"]+)""#;
 
 pub fn parse_landing_server(html: &str) -> Result<String, GfileError> {
-    let re = Regex::new(SERVER_ASSIGNMENT_RE).expect("valid upload server regex");
-    let server = re
+    static SERVER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(SERVER_ASSIGNMENT_RE).expect("valid upload server regex"));
+    let server = SERVER_RE
         .captures(html)
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str().trim().to_owned())

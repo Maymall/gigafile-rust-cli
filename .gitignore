@@ -1,5 +1,7 @@
 # Rust/build output
 /target/
+__pycache__/
+*.py[cod]
 
 # Local handoff, investigation, and planning material.
 # These are for Claude/Codex coordination on this machine, not repository content.

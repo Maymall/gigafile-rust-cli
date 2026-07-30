@@ -6,14 +6,15 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use futures_util::TryStreamExt;
-use reqwest::{Method, StatusCode, header, multipart};
+use reqwest::{StatusCode, header, multipart};
 use serde_json::Value;
 use tokio::{
     fs::{self, File},
@@ -27,6 +28,7 @@ use uuid::Uuid;
 use crate::{
     error::{GfileError, IoOp, boxed, io_error, network_error, usage},
     http,
+    naming::escape_terminal_text,
     parser::{
         download::{PageKind, parse_download_page},
         landing::parse_landing_server,
@@ -46,6 +48,8 @@ pub const DEFAULT_UPLOAD_THREADS: u8 = 1;
 const DEFAULT_ENTRY_URL: &str = "https://gigafile.nu/";
 const UPLOAD_ENDPOINT_PATH: &str = "/upload_chunk.php";
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const MAX_READ_AHEAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_UPLOAD_CHUNKS: u64 = 100_000;
 const FILE_PART_NAME: &str = "blob";
 const FILE_PART_MIME: &str = "application/octet-stream";
 const LIFETIME_VALUES: &[u16] = &[3, 5, 7, 14, 30, 60, 100];
@@ -119,11 +123,30 @@ struct FilePlan {
     file_name: String,
     size: u64,
     chunks: Vec<ChunkPlan>,
+    source: Arc<std::fs::File>,
+    fingerprint: SourceFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct ChunkAttemptError {
+    error: GfileError,
+    body_started: bool,
 }
 
 #[derive(Debug)]
 struct UploadActivity {
-    last: Mutex<Instant>,
+    started: Instant,
+    last_activity_ns: AtomicU64,
 }
 
 struct ChunkUploadContext<'a> {
@@ -149,7 +172,7 @@ struct PreparedChunkUploadContext<'a> {
 #[derive(Debug, Clone)]
 struct PreparedChunk {
     plan: ChunkPlan,
-    body: Arc<Vec<u8>>,
+    body: Bytes,
 }
 
 #[derive(Debug, Default)]
@@ -169,30 +192,37 @@ struct UploadCompletion {
 impl UploadActivity {
     fn new() -> Self {
         Self {
-            last: Mutex::new(Instant::now()),
+            started: Instant::now(),
+            last_activity_ns: AtomicU64::new(0),
         }
     }
 
     fn mark(&self) {
-        *self.last.lock().expect("upload activity mutex poisoned") = Instant::now();
+        self.last_activity_ns
+            .store(self.elapsed_ns(), Ordering::Relaxed);
     }
 
     fn remaining_before_idle_timeout(&self, timeout: Duration) -> Duration {
-        let elapsed = self
-            .last
-            .lock()
-            .expect("upload activity mutex poisoned")
-            .elapsed();
+        let elapsed = Duration::from_nanos(
+            self.elapsed_ns()
+                .saturating_sub(self.last_activity_ns.load(Ordering::Relaxed)),
+        );
         timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO)
     }
 
     fn is_idle_for_at_least(&self, timeout: Duration) -> bool {
-        self.last
-            .lock()
-            .expect("upload activity mutex poisoned")
-            .elapsed()
-            >= timeout
+        self.elapsed_ns()
+            .saturating_sub(self.last_activity_ns.load(Ordering::Relaxed))
+            >= duration_ns(timeout)
     }
+
+    fn elapsed_ns(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 pub fn default_entry_url() -> &'static str {
@@ -257,14 +287,49 @@ pub async fn upload(options: UploadOptions) -> Result<UploadReport, GfileError> 
     validate_chunk_size(options.chunk_size)?;
     validate_threads(options.threads)?;
     let file_plan = build_file_plan(&options.file, options.chunk_size).await?;
-    let client = http::build_client(options.user_agent.as_deref())?;
-    let endpoint = upload_endpoint(&fetch_upload_server(&client, &options).await?);
+    let client =
+        http::build_gigafile_client(options.user_agent.as_deref(), options.allow_any_host)?;
+    let endpoint = upload_endpoint(
+        &fetch_upload_server(&client, &options).await?,
+        options.allow_any_host,
+    )?;
     let upload_id = Uuid::new_v4().simple().to_string();
-    let completion = if options.threads > DEFAULT_UPLOAD_THREADS && file_plan.chunks.len() > 1 {
-        upload_chunks_read_ahead(&client, &endpoint, &file_plan, &upload_id, &options).await?
+    let read_ahead_window = bounded_read_ahead_window(
+        options.threads,
+        file_plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.len)
+            .max()
+            .unwrap_or(1),
+    );
+    let completion = if read_ahead_window > 1 && file_plan.chunks.len() > 1 {
+        upload_chunks_read_ahead(
+            &client,
+            &endpoint,
+            &file_plan,
+            &upload_id,
+            &options,
+            read_ahead_window,
+        )
+        .await?
     } else {
+        if options.threads > DEFAULT_UPLOAD_THREADS && file_plan.chunks.len() > 1 {
+            warn!(
+                requested = options.threads,
+                budget_bytes = MAX_READ_AHEAD_BYTES,
+                "upload chunks are too large for bounded read-ahead; using streaming upload"
+            );
+        }
         upload_chunks_serial(&client, &endpoint, &file_plan, &upload_id, &options).await?
     };
+    if parse_download_url(&completion.url, options.allow_any_host).is_err() {
+        return Err(GfileError::UploadRejected {
+            detail: "upload response contained an unsupported download URL".to_owned(),
+            status: None,
+            retryable: false,
+        });
+    }
     let expires_at_estimate = estimate_expires_at(SystemTime::now(), options.lifetime);
     let verified = if options.verify {
         verify_uploaded_file(&client, &completion.url, file_plan.size, &options).await?
@@ -290,7 +355,8 @@ async fn upload_chunks_serial(
     upload_id: &str,
     options: &UploadOptions,
 ) -> Result<UploadCompletion, GfileError> {
-    let progress = ByteProgress::new(Some(file_plan.size), options.quiet, &file_plan.file_name);
+    let display_name = escape_terminal_text(&file_plan.file_name);
+    let progress = ByteProgress::new(Some(file_plan.size), options.quiet, &display_name);
     let mut state = UploadResponseState::default();
     let mut confirmed_bytes = 0;
     let chunk_context = ChunkUploadContext {
@@ -304,10 +370,28 @@ async fn upload_chunks_serial(
     };
 
     for chunk in &file_plan.chunks {
-        let response = send_chunk_with_retries(&chunk_context, *chunk, confirmed_bytes).await?;
-        observe_upload_response(*chunk, &response, &mut state);
+        if let Err(error) = validate_source_unchanged(file_plan).await {
+            progress.finish();
+            return Err(error);
+        }
+        let response = match send_chunk_with_retries(&chunk_context, *chunk, confirmed_bytes).await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                progress.finish();
+                return Err(error);
+            }
+        };
+        if let Err(error) = observe_upload_response(*chunk, &response, &mut state) {
+            progress.finish();
+            return Err(error);
+        }
         confirmed_bytes += chunk.len;
         progress.set_position(confirmed_bytes);
+    }
+    if let Err(error) = validate_source_unchanged(file_plan).await {
+        progress.finish();
+        return Err(error);
     }
     progress.finish();
 
@@ -320,6 +404,7 @@ async fn upload_chunks_read_ahead(
     file_plan: &FilePlan,
     upload_id: &str,
     options: &UploadOptions,
+    window: usize,
 ) -> Result<UploadCompletion, GfileError> {
     let segments = file_plan
         .chunks
@@ -332,7 +417,7 @@ async fn upload_chunks_read_ahead(
     let progress = SegmentedProgress::new_with_segment_label(
         Some(file_plan.size),
         options.quiet,
-        &file_plan.file_name,
+        &escape_terminal_text(&file_plan.file_name),
         &segments,
         "chunk",
     );
@@ -347,44 +432,49 @@ async fn upload_chunks_read_ahead(
     };
     let mut state = UploadResponseState::default();
     let mut pending = BTreeMap::new();
-    let mut ready = BTreeMap::new();
     let mut next_chunk = 0;
-    let window = usize::from(options.threads);
+    if window < usize::from(options.threads) {
+        warn!(
+            requested = options.threads,
+            effective = window,
+            budget_bytes = MAX_READ_AHEAD_BYTES,
+            "reducing upload read-ahead window to stay within the memory budget"
+        );
+    }
     fill_prefetch_window(
         &mut pending,
-        ready.len(),
+        // Read only chunk zero before the first POST. The rest of the window
+        // is launched once that chunk is ready and overlaps its upload.
+        window.saturating_sub(1),
         file_plan,
         &mut next_chunk,
         window,
     );
-    if let Err(error) = collect_prefetch_window(&mut pending, &mut ready, &file_plan.path).await {
-        abort_prefetches(&mut pending);
-        progress.finish();
-        return Err(error);
-    }
 
     for chunk in &file_plan.chunks {
-        let prepared = match ready.remove(&chunk.index) {
-            Some(prepared) => prepared,
-            None => {
-                let Some(handle) = pending.remove(&chunk.index) else {
-                    abort_prefetches(&mut pending);
-                    progress.finish();
-                    return Err(usage("upload read-ahead queue lost a chunk"));
-                };
-                match await_prepared_chunk(handle, &file_plan.path).await {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        abort_prefetches(&mut pending);
-                        progress.finish();
-                        return Err(error);
-                    }
-                }
+        let Some(handle) = pending.remove(&chunk.index) else {
+            abort_prefetches(&mut pending);
+            progress.finish();
+            return Err(usage("upload read-ahead queue lost a chunk"));
+        };
+        let prepared = match await_prepared_chunk(handle, &file_plan.path).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                abort_prefetches(&mut pending);
+                progress.finish();
+                return Err(error);
             }
         };
+        if let Err(error) = validate_source_unchanged(file_plan).await {
+            abort_prefetches(&mut pending);
+            progress.finish();
+            return Err(error);
+        }
         fill_prefetch_window(
             &mut pending,
-            ready.len(),
+            // `prepared` remains resident while its request is in flight, so
+            // count it as one slot in the total memory budget.
+            1,
             file_plan,
             &mut next_chunk,
             window,
@@ -397,12 +487,27 @@ async fn upload_chunks_read_ahead(
                 return Err(error);
             }
         };
-        observe_upload_response(prepared.plan, &response, &mut state);
+        if let Err(error) = observe_upload_response(prepared.plan, &response, &mut state) {
+            abort_prefetches(&mut pending);
+            progress.finish();
+            return Err(error);
+        }
         progress.set_segment_position(progress_index(prepared.plan), prepared.plan.len);
+    }
+    if let Err(error) = validate_source_unchanged(file_plan).await {
+        abort_prefetches(&mut pending);
+        progress.finish();
+        return Err(error);
     }
     progress.finish();
 
     finish_upload_state(state)
+}
+
+fn bounded_read_ahead_window(requested: u8, largest_chunk: u64) -> usize {
+    let budget_window =
+        usize::try_from(MAX_READ_AHEAD_BYTES / largest_chunk.max(1)).unwrap_or(usize::MAX);
+    usize::from(requested).min(budget_window)
 }
 
 async fn fetch_upload_server(
@@ -417,10 +522,13 @@ async fn fetch_upload_server(
         Some(options.timeout),
     )
     .await?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|source| network_error(source, "reading upload page body"))?;
+    let bytes = http::read_body_limited(
+        response,
+        http::PAGE_BODY_LIMIT,
+        options.timeout,
+        "reading upload page body",
+    )
+    .await?;
 
     if let Some(path) = &options.dump_page {
         fs::write(path, &bytes)
@@ -435,17 +543,53 @@ async fn fetch_upload_server(
     parse_landing_server(&html)
 }
 
-fn upload_endpoint(server: &str) -> String {
+fn upload_endpoint(server: &str, allow_any_host: bool) -> Result<String, GfileError> {
     let trimmed = server.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        format!("{trimmed}{UPLOAD_ENDPOINT_PATH}")
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_owned()
     } else {
-        format!("https://{trimmed}{UPLOAD_ENDPOINT_PATH}")
+        format!("https://{trimmed}")
+    };
+    let mut url = reqwest::Url::parse(&candidate).map_err(|_| GfileError::Parse {
+        what: "upload page contained an invalid server URL".to_owned(),
+        hint: "The upload page structure may have changed; rerun with --dump-page and -vv."
+            .to_owned(),
+    })?;
+    let host = url.host_str().unwrap_or_default();
+    let valid_host = if allow_any_host {
+        matches!(url.scheme(), "http" | "https") && !host.is_empty()
+    } else {
+        url.scheme() == "https" && url.port().is_none() && numeric_gigafile_host(host)
+    };
+    if !valid_host
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(GfileError::Parse {
+            what: "upload page pointed to an untrusted server".to_owned(),
+            hint: "The upload page structure may have changed; rerun with --dump-page and -vv."
+                .to_owned(),
+        });
     }
+    url.set_path(UPLOAD_ENDPOINT_PATH);
+    Ok(url.to_string())
+}
+
+fn numeric_gigafile_host(host: &str) -> bool {
+    host.strip_suffix(".gigafile.nu").is_some_and(|prefix| {
+        !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 async fn build_file_plan(path: &Path, chunk_size: u64) -> Result<FilePlan, GfileError> {
-    let metadata = fs::metadata(path)
+    let file = File::open(path)
+        .await
+        .map_err(|source| io_error(source, path, IoOp::Read))?;
+    let metadata = file
+        .metadata()
         .await
         .map_err(|source| io_error(source, path, IoOp::Metadata))?;
     if !metadata.is_file() {
@@ -460,13 +604,52 @@ async fn build_file_plan(path: &Path, chunk_size: u64) -> Result<FilePlan, Gfile
         .filter(|value| !value.is_empty())
         .ok_or_else(|| usage("upload path must have a file name"))?;
 
+    validate_chunk_count(metadata.len(), chunk_size)?;
     let chunks = chunk_plans(metadata.len(), chunk_size);
+    let file = file.into_std().await;
     Ok(FilePlan {
         path: path.to_owned(),
         file_name,
         size: metadata.len(),
         chunks,
+        source: Arc::new(file),
+        fingerprint: source_fingerprint(&metadata),
     })
+}
+
+fn source_fingerprint(metadata: &std::fs::Metadata) -> SourceFingerprint {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+
+    SourceFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+async fn validate_source_unchanged(file_plan: &FilePlan) -> Result<(), GfileError> {
+    let handle_metadata = file_plan
+        .source
+        .metadata()
+        .map_err(|error| io_error(error, &file_plan.path, IoOp::Metadata))?;
+    let path_metadata = fs::metadata(&file_plan.path)
+        .await
+        .map_err(|error| io_error(error, &file_plan.path, IoOp::Metadata))?;
+    if source_fingerprint(&handle_metadata) != file_plan.fingerprint
+        || source_fingerprint(&path_metadata) != file_plan.fingerprint
+    {
+        return Err(GfileError::UploadRejected {
+            detail: "the local source file changed during upload; the upload was stopped to avoid mixing file versions"
+                .to_owned(),
+            status: None,
+            retryable: false,
+        });
+    }
+    Ok(())
 }
 
 fn chunk_plans(size: u64, chunk_size: u64) -> Vec<ChunkPlan> {
@@ -484,6 +667,17 @@ fn chunk_plans(size: u64, chunk_size: u64) -> Vec<ChunkPlan> {
         .collect()
 }
 
+fn validate_chunk_count(size: u64, chunk_size: u64) -> Result<(), GfileError> {
+    let count = size.div_ceil(chunk_size);
+    if count <= MAX_UPLOAD_CHUNKS && usize::try_from(count).is_ok() {
+        Ok(())
+    } else {
+        Err(usage(format!(
+            "upload would require {count} chunks; increase --chunk-size (maximum {MAX_UPLOAD_CHUNKS} chunks)"
+        )))
+    }
+}
+
 fn fill_prefetch_window(
     pending: &mut BTreeMap<u64, JoinHandle<Result<PreparedChunk, GfileError>>>,
     ready_len: usize,
@@ -494,28 +688,13 @@ fn fill_prefetch_window(
     while ready_len + pending.len() < window && *next_chunk < file_plan.chunks.len() {
         let chunk = file_plan.chunks[*next_chunk];
         let path = file_plan.path.clone();
+        let source = Arc::clone(&file_plan.source);
         pending.insert(
             chunk.index,
-            tokio::spawn(async move { read_prepared_chunk(path, chunk).await }),
+            tokio::task::spawn_blocking(move || read_prepared_chunk(source, path, chunk)),
         );
         *next_chunk += 1;
     }
-}
-
-async fn collect_prefetch_window(
-    pending: &mut BTreeMap<u64, JoinHandle<Result<PreparedChunk, GfileError>>>,
-    ready: &mut BTreeMap<u64, PreparedChunk>,
-    path: &Path,
-) -> Result<(), GfileError> {
-    let indexes = pending.keys().copied().collect::<Vec<_>>();
-    for index in indexes {
-        let Some(handle) = pending.remove(&index) else {
-            return Err(usage("upload read-ahead queue lost a chunk"));
-        };
-        let prepared = await_prepared_chunk(handle, path).await?;
-        ready.insert(prepared.plan.index, prepared);
-    }
-    Ok(())
 }
 
 fn abort_prefetches(pending: &mut BTreeMap<u64, JoinHandle<Result<PreparedChunk, GfileError>>>) {
@@ -537,24 +716,57 @@ async fn await_prepared_chunk(
     })?
 }
 
-async fn read_prepared_chunk(path: PathBuf, chunk: ChunkPlan) -> Result<PreparedChunk, GfileError> {
-    let mut file = File::open(&path)
-        .await
-        .map_err(|source| io_error(source, &path, IoOp::Read))?;
-    file.seek(SeekFrom::Start(chunk.offset))
-        .await
-        .map_err(|source| io_error(source, &path, IoOp::Read))?;
+fn read_prepared_chunk(
+    source: Arc<std::fs::File>,
+    path: PathBuf,
+    chunk: ChunkPlan,
+) -> Result<PreparedChunk, GfileError> {
     let len = usize::try_from(chunk.len)
         .map_err(|_| usage("upload chunk size is too large for this platform"))?;
     let mut body = vec![0_u8; len];
-    file.read_exact(&mut body)
-        .await
+    read_exact_at(&source, &mut body, chunk.offset)
         .map_err(|source| io_error(source, &path, IoOp::Read))?;
 
     Ok(PreparedChunk {
         plan: chunk,
-        body: Arc::new(body),
+        body: Bytes::from(body),
     })
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, mut body: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    while !body.is_empty() {
+        match file.read_at(body, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                offset += read as u64;
+                body = &mut body[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut body: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+
+    while !body.is_empty() {
+        match file.seek_read(body, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                offset += read as u64;
+                body = &mut body[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 async fn send_chunk_with_retries(
@@ -567,19 +779,23 @@ async fn send_chunk_with_retries(
         context.progress.set_position(confirmed_bytes);
         match send_chunk_once(context, chunk, confirmed_bytes).await {
             Ok(value) => return Ok(value),
-            Err(error) if upload_retryable(&error) && attempt < context.options.retries => {
+            Err(attempt_error)
+                if !attempt_error.body_started
+                    && upload_retryable(&attempt_error.error)
+                    && attempt < context.options.retries =>
+            {
                 context.progress.set_position(confirmed_bytes);
                 warn!(
                     "retrying upload chunk {} after error: {}",
                     chunk.index,
-                    error.user_message()
+                    attempt_error.error.user_message()
                 );
                 tokio::time::sleep(http::retry_delay(attempt)).await;
                 attempt += 1;
             }
-            Err(error) => {
+            Err(attempt_error) => {
                 context.progress.set_position(confirmed_bytes);
-                return Err(error);
+                return Err(attempt_error.error);
             }
         }
     }
@@ -589,19 +805,28 @@ async fn send_chunk_once(
     context: &ChunkUploadContext<'_>,
     chunk: ChunkPlan,
     confirmed_bytes: u64,
-) -> Result<Value, GfileError> {
-    let mut file = File::open(&context.file_plan.path)
-        .await
-        .map_err(|source| io_error(source, &context.file_plan.path, IoOp::Read))?;
-    file.seek(SeekFrom::Start(chunk.offset))
-        .await
-        .map_err(|source| io_error(source, &context.file_plan.path, IoOp::Read))?;
-    let reader = file.take(chunk.len);
+) -> Result<Value, ChunkAttemptError> {
     let activity = Arc::new(UploadActivity::new());
     let sent_in_attempt = Arc::new(AtomicU64::new(0));
     let activity_for_stream = Arc::clone(&activity);
     let sent_for_stream = Arc::clone(&sent_in_attempt);
     let progress_for_stream = context.progress.clone();
+    let file = context
+        .file_plan
+        .source
+        .try_clone()
+        .map_err(|source| ChunkAttemptError {
+            error: io_error(source, &context.file_plan.path, IoOp::Read),
+            body_started: false,
+        })?;
+    let mut file = File::from_std(file);
+    file.seek(SeekFrom::Start(chunk.offset))
+        .await
+        .map_err(|source| ChunkAttemptError {
+            error: io_error(source, &context.file_plan.path, IoOp::Read),
+            body_started: false,
+        })?;
+    let reader = file.take(chunk.len);
     let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE).map_ok(move |bytes| {
         activity_for_stream.mark();
         let sent =
@@ -623,15 +848,21 @@ async fn send_chunk_once(
         .part(FIELD_FILE, part);
 
     let request = context.client.post(context.endpoint).multipart(form).send();
-    let response = send_with_idle_timeout(
-        request,
-        activity,
-        context.options.timeout,
-        "uploading chunk",
-    )
-    .await?;
-
-    parse_upload_chunk_response(response).await
+    let result = async {
+        let response = send_with_idle_timeout(
+            request,
+            activity,
+            context.options.timeout,
+            "uploading chunk",
+        )
+        .await?;
+        parse_upload_chunk_response(response, context.options.timeout).await
+    }
+    .await;
+    result.map_err(|error| ChunkAttemptError {
+        error,
+        body_started: sent_in_attempt.load(Ordering::Relaxed) != 0,
+    })
 }
 
 async fn send_prepared_chunk_with_retries(
@@ -644,19 +875,23 @@ async fn send_prepared_chunk_with_retries(
         context.progress.set_segment_position(progress_index, 0);
         match send_prepared_chunk_once(context, prepared).await {
             Ok(value) => return Ok(value),
-            Err(error) if upload_retryable(&error) && attempt < context.options.retries => {
+            Err(attempt_error)
+                if !attempt_error.body_started
+                    && upload_retryable(&attempt_error.error)
+                    && attempt < context.options.retries =>
+            {
                 context.progress.set_segment_position(progress_index, 0);
                 warn!(
                     "retrying upload chunk {} after error: {}",
                     prepared.plan.index,
-                    error.user_message()
+                    attempt_error.error.user_message()
                 );
                 tokio::time::sleep(http::retry_delay(attempt)).await;
                 attempt += 1;
             }
-            Err(error) => {
+            Err(attempt_error) => {
                 context.progress.set_segment_position(progress_index, 0);
-                return Err(error);
+                return Err(attempt_error.error);
             }
         }
     }
@@ -665,14 +900,14 @@ async fn send_prepared_chunk_with_retries(
 async fn send_prepared_chunk_once(
     context: &PreparedChunkUploadContext<'_>,
     prepared: &PreparedChunk,
-) -> Result<Value, GfileError> {
+) -> Result<Value, ChunkAttemptError> {
     let activity = Arc::new(UploadActivity::new());
     let sent_in_attempt = Arc::new(AtomicU64::new(0));
     let progress_index = progress_index(prepared.plan);
     let activity_for_stream = Arc::clone(&activity);
     let sent_for_stream = Arc::clone(&sent_in_attempt);
     let progress_for_stream = context.progress.clone();
-    let body_for_stream = Arc::clone(&prepared.body);
+    let body_for_stream = prepared.body.clone();
     let stream = futures_util::stream::unfold((body_for_stream, 0_usize), move |(body, offset)| {
         let activity_for_stream = Arc::clone(&activity_for_stream);
         let sent_for_stream = Arc::clone(&sent_for_stream);
@@ -682,12 +917,12 @@ async fn send_prepared_chunk_once(
                 return None;
             }
             let end = (offset + STREAM_CHUNK_SIZE).min(body.len());
-            let bytes = body[offset..end].to_vec();
+            let bytes = body.slice(offset..end);
             activity_for_stream.mark();
             let sent = sent_for_stream.fetch_add(bytes.len() as u64, Ordering::Relaxed)
                 + bytes.len() as u64;
             progress_for_stream.set_segment_position(progress_index, sent);
-            Some((Ok::<Vec<u8>, io::Error>(bytes), (body, end)))
+            Some((Ok::<Bytes, io::Error>(bytes), (body, end)))
         }
     });
     let body = reqwest::Body::wrap_stream(stream);
@@ -704,18 +939,27 @@ async fn send_prepared_chunk_once(
         .part(FIELD_FILE, part);
 
     let request = context.client.post(context.endpoint).multipart(form).send();
-    let response = send_with_idle_timeout(
-        request,
-        activity,
-        context.options.timeout,
-        "uploading chunk",
-    )
-    .await?;
-
-    parse_upload_chunk_response(response).await
+    let result = async {
+        let response = send_with_idle_timeout(
+            request,
+            activity,
+            context.options.timeout,
+            "uploading chunk",
+        )
+        .await?;
+        parse_upload_chunk_response(response, context.options.timeout).await
+    }
+    .await;
+    result.map_err(|error| ChunkAttemptError {
+        error,
+        body_started: sent_in_attempt.load(Ordering::Relaxed) != 0,
+    })
 }
 
-async fn parse_upload_chunk_response(response: reqwest::Response) -> Result<Value, GfileError> {
+async fn parse_upload_chunk_response(
+    response: reqwest::Response,
+    timeout: Duration,
+) -> Result<Value, GfileError> {
     if response.status().is_server_error() {
         let status = response.status().as_u16();
         return Err(GfileError::UploadRejected {
@@ -729,26 +973,31 @@ async fn parse_upload_chunk_response(response: reqwest::Response) -> Result<Valu
     }
     if !response.status().is_success() {
         let status = response.status().as_u16();
+        let retryable = http::is_retryable_status(response.status());
         return Err(GfileError::UploadRejected {
             detail: format!(
                 "server returned HTTP {} for an upload chunk; re-upload the whole file",
                 status
             ),
             status: Some(status),
-            retryable: false,
+            retryable,
         });
     }
 
-    response
-        .json::<Value>()
-        .await
-        .map_err(|source| GfileError::UploadRejected {
-            detail: format!(
-                "upload endpoint returned a non-JSON response ({source}); re-upload the whole file"
-            ),
-            status: None,
-            retryable: false,
-        })
+    let body = http::read_body_limited(
+        response,
+        http::API_BODY_LIMIT,
+        timeout,
+        "reading upload response body",
+    )
+    .await?;
+    serde_json::from_slice::<Value>(&body).map_err(|source| GfileError::UploadRejected {
+        detail: format!(
+            "upload endpoint returned a non-JSON response ({source}); re-upload the whole file"
+        ),
+        status: None,
+        retryable: false,
+    })
 }
 
 async fn send_with_idle_timeout<F>(
@@ -805,12 +1054,19 @@ async fn verify_uploaded_file(
             return Ok(None);
         }
     };
-    let page_bytes = match page.bytes().await {
+    let page_bytes = match http::read_body_limited(
+        page,
+        http::PAGE_BODY_LIMIT,
+        options.timeout,
+        "reading upload verification page body",
+    )
+    .await
+    {
         Ok(bytes) => bytes,
-        Err(source) => {
+        Err(error) => {
             warn!(
                 "upload verification skipped because the download page body could not be read: {}",
-                source
+                error.user_message()
             );
             return Ok(None);
         }
@@ -836,19 +1092,12 @@ async fn verify_uploaded_file(
     };
 
     let download_url = url_info.download_url_for(file_id, None);
-    match content_length_via_head(client, &download_url, options).await {
+    match content_length_via_range_get(client, &download_url, options).await {
         VerifyProbe::Length(actual) => compare_verified_size(expected, actual).map(Some),
-        VerifyProbe::Unsupported => {
-            match content_length_via_get(client, &download_url, options).await {
-                VerifyProbe::Length(actual) => compare_verified_size(expected, actual).map(Some),
-                VerifyProbe::Unsupported | VerifyProbe::Unavailable => {
-                    warn!("upload verification skipped because Content-Length is unavailable");
-                    Ok(None)
-                }
-            }
-        }
         VerifyProbe::Unavailable => {
-            warn!("upload verification skipped because the download endpoint is unavailable");
+            warn!(
+                "upload verification skipped because the download endpoint did not return a valid one-byte range"
+            );
             Ok(None)
         }
     }
@@ -856,61 +1105,62 @@ async fn verify_uploaded_file(
 
 enum VerifyProbe {
     Length(u64),
-    Unsupported,
     Unavailable,
 }
 
-async fn content_length_via_head(
+async fn content_length_via_range_get(
     client: &reqwest::Client,
     url: &str,
     options: &UploadOptions,
 ) -> VerifyProbe {
-    match send_verify_request(client, Method::HEAD, url, options).await {
-        Ok(response) if response.status().is_success() => response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(VerifyProbe::Length)
-            .unwrap_or(VerifyProbe::Unsupported),
-        Ok(response)
-            if matches!(
-                response.status(),
-                StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-            ) =>
-        {
-            VerifyProbe::Unsupported
+    match send_verify_request(client, url, options).await {
+        Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
+            strict_range_total(response.headers())
+                .map(VerifyProbe::Length)
+                .unwrap_or(VerifyProbe::Unavailable)
         }
         Ok(_) | Err(_) => VerifyProbe::Unavailable,
     }
 }
 
-async fn content_length_via_get(
-    client: &reqwest::Client,
-    url: &str,
-    options: &UploadOptions,
-) -> VerifyProbe {
-    match send_verify_request(client, Method::GET, url, options).await {
-        Ok(response) if response.status().is_success() => response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(VerifyProbe::Length)
-            .unwrap_or(VerifyProbe::Unsupported),
-        Ok(_) | Err(_) => VerifyProbe::Unavailable,
+fn strict_range_total(headers: &header::HeaderMap) -> Option<u64> {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"))
+    {
+        return None;
     }
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "1")
+    {
+        return None;
+    }
+
+    let value = headers.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    let range = value.strip_prefix("bytes ")?;
+    let (span, total) = range.split_once('/')?;
+    if span != "0-0" {
+        return None;
+    }
+    total.parse::<u64>().ok().filter(|total| *total > 0)
 }
 
 async fn send_verify_request(
     client: &reqwest::Client,
-    method: Method,
     url: &str,
     options: &UploadOptions,
 ) -> Result<reqwest::Response, GfileError> {
     let mut attempt = 0;
     loop {
-        let request = client.request(method.clone(), url).send();
+        let request = client
+            .get(url)
+            .header(header::RANGE, "bytes=0-0")
+            .header(header::ACCEPT_ENCODING, "identity")
+            .send();
         let result = tokio::time::timeout(options.timeout, request)
             .await
             .map_err(|_| timeout_network_error("starting upload verification request"))
@@ -919,7 +1169,10 @@ async fn send_verify_request(
                     .map_err(|source| network_error(source, "starting upload verification request"))
             });
         match result {
-            Ok(response) if response.status().is_server_error() && attempt < options.retries => {
+            Ok(response)
+                if http::is_retryable_status(response.status()) && attempt < options.retries =>
+            {
+                drop(response);
                 tokio::time::sleep(http::retry_delay(attempt)).await;
                 attempt += 1;
             }
@@ -952,14 +1205,35 @@ fn upload_retryable(error: &GfileError) -> bool {
     }
 }
 
-fn observe_upload_response(chunk: ChunkPlan, response: &Value, state: &mut UploadResponseState) {
+fn observe_upload_response(
+    chunk: ChunkPlan,
+    response: &Value,
+    state: &mut UploadResponseState,
+) -> Result<(), GfileError> {
     debug!(
         chunk = chunk.index,
         response = %redact_upload_response(response),
         "upload chunk response"
     );
-    if let Some(status) = response.get("status") {
-        debug!(?status, chunk = chunk.index, "upload chunk status field");
+    match response.get("status").and_then(Value::as_i64) {
+        Some(0) => {}
+        Some(status) => {
+            return Err(GfileError::UploadRejected {
+                detail: format!("upload chunk {} returned status {status}", chunk.index),
+                status: u16::try_from(status).ok(),
+                retryable: false,
+            });
+        }
+        None => {
+            return Err(GfileError::UploadRejected {
+                detail: format!(
+                    "upload chunk {} response did not contain a numeric status field",
+                    chunk.index
+                ),
+                status: None,
+                retryable: false,
+            });
+        }
     }
     if let Some(url) = response
         .get("url")
@@ -974,6 +1248,7 @@ fn observe_upload_response(chunk: ChunkPlan, response: &Value, state: &mut Uploa
     if let Some(filename) = optional_response_string(response, "filename") {
         state.remote_filename = Some(filename);
     }
+    Ok(())
 }
 
 fn finish_upload_state(state: UploadResponseState) -> Result<UploadCompletion, GfileError> {
@@ -1074,6 +1349,14 @@ mod tests {
     }
 
     #[test]
+    fn read_ahead_window_accounts_for_the_active_chunk() {
+        assert_eq!(bounded_read_ahead_window(16, 128 * 1024 * 1024), 4);
+        assert_eq!(bounded_read_ahead_window(16, 300 * 1024 * 1024), 1);
+        assert_eq!(bounded_read_ahead_window(16, 1024 * 1024 * 1024), 0);
+        assert_eq!(bounded_read_ahead_window(3, 1024), 3);
+    }
+
+    #[test]
     fn chunk_plans_are_zero_based_and_cover_file() {
         let chunks = chunk_plans(5, 2);
 
@@ -1100,6 +1383,14 @@ mod tests {
     }
 
     #[test]
+    fn chunk_count_is_bounded_before_allocating_the_plan() {
+        assert!(validate_chunk_count(MAX_UPLOAD_CHUNKS * MIN_CHUNK_SIZE, MIN_CHUNK_SIZE).is_ok());
+        assert!(
+            validate_chunk_count((MAX_UPLOAD_CHUNKS + 1) * MIN_CHUNK_SIZE, MIN_CHUNK_SIZE).is_err()
+        );
+    }
+
+    #[test]
     fn upload_response_redaction_hides_delkey_fields() {
         let value = serde_json::json!({
             "status": 0,
@@ -1114,5 +1405,35 @@ mod tests {
         assert!(!redacted.contains("EXAMPLE-DELETE-0000"));
         assert!(redacted.contains("\"delkey\":\"***\""));
         assert!(redacted.contains("\"delete_key\":\"***\""));
+    }
+
+    #[test]
+    fn upload_response_requires_zero_numeric_status() {
+        let chunk = ChunkPlan {
+            index: 2,
+            offset: 0,
+            len: 1,
+        };
+        for response in [serde_json::json!({"status": 1}), serde_json::json!({})] {
+            let error =
+                observe_upload_response(chunk, &response, &mut UploadResponseState::default())
+                    .unwrap_err();
+            assert!(matches!(error, GfileError::UploadRejected { .. }));
+        }
+    }
+
+    #[test]
+    fn upload_endpoint_restricts_production_origin() {
+        assert_eq!(
+            upload_endpoint("99.gigafile.nu", false).unwrap(),
+            "https://99.gigafile.nu/upload_chunk.php"
+        );
+        assert!(upload_endpoint("http://99.gigafile.nu", false).is_err());
+        assert!(upload_endpoint("https://example.com", false).is_err());
+        assert!(upload_endpoint("https://99.gigafile.nu.evil.test", false).is_err());
+        assert_eq!(
+            upload_endpoint("http://127.0.0.1:1234", true).unwrap(),
+            "http://127.0.0.1:1234/upload_chunk.php"
+        );
     }
 }

@@ -39,7 +39,8 @@ pub struct InfoFileRecord {
 
 pub async fn info(options: InfoOptions) -> Result<InfoReport, GfileError> {
     let url_info = parse_download_url(&options.url, options.allow_any_host)?;
-    let client = http::build_client(options.user_agent.as_deref())?;
+    let client =
+        http::build_gigafile_client(options.user_agent.as_deref(), options.allow_any_host)?;
     let response = http::get_with_retries_and_timeout(
         &client,
         &url_info.page_url,
@@ -50,13 +51,13 @@ pub async fn info(options: InfoOptions) -> Result<InfoReport, GfileError> {
     .await?;
     let status = response.status().as_u16();
     let final_url = response.url().clone();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|source| GfileError::Network {
-            source: Box::new(source),
-            context: "reading info page body".to_owned(),
-        })?;
+    let bytes = http::read_body_limited(
+        response,
+        http::PAGE_BODY_LIMIT,
+        options.timeout,
+        "reading info page body",
+    )
+    .await?;
 
     if let Some(path) = &options.dump_page {
         fs::write(path, &bytes)

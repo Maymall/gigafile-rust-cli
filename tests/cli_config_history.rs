@@ -629,7 +629,7 @@ fn history_list_json_and_clear_use_test_data_dir() {
         &path,
         concat!(
             "{\"timestamp\":\"2026-07-03T00:00:00Z\",\"operation\":\"download\",\"page_url\":\"https://23.gigafile.nu/0123abcd-000000example\",\"files\":[\"old.bin\"],\"bytes\":1,\"result\":\"ok\"}\n",
-            "{\"timestamp\":\"2026-07-03T00:00:01Z\",\"operation\":\"upload\",\"page_url\":\"https://23.gigafile.nu/0123abcd-000000example\",\"files\":[\"new.bin\"],\"bytes\":2,\"result\":\"ok\"}\n",
+            "{\"timestamp\":\"2026-07-03T00:00:01Z\",\"operation\":\"upload\",\"page_url\":\"https://23.gigafile.nu/0123abcd-000000example\",\"files\":[\"new.bin\"],\"bytes\":2,\"result\":\"ok\",\"delete_key\":\"S3CR\"}\n",
         ),
     )
     .unwrap();
@@ -645,6 +645,8 @@ fn history_list_json_and_clear_use_test_data_dir() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["entries"].as_array().unwrap().len(), 1);
     assert_eq!(value["entries"][0]["files"][0], "new.bin");
+    assert!(value["entries"][0].get("delete_key").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("S3CR"));
 
     Command::cargo_bin("rgfile")
         .unwrap()

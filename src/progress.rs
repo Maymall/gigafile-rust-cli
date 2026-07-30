@@ -2,7 +2,10 @@
 
 use std::{
     io::{self, IsTerminal, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -12,21 +15,41 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 /// in-place redraw (stray stderr writes make indicatif reprint the whole
 /// group below the old frame).
 static ACTIVE_DRAW: Mutex<Option<ActiveDraw>> = Mutex::new(None);
+static NEXT_DRAW_OWNER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-enum ActiveDraw {
+struct ActiveDraw {
+    owner: u64,
+    display: DrawDisplay,
+}
+
+#[derive(Clone)]
+enum DrawDisplay {
     Single(ProgressBar),
     Multi(MultiProgress),
 }
 
-fn set_active_draw(active: Option<ActiveDraw>) {
+fn set_active_draw(display: DrawDisplay) -> u64 {
+    let owner = NEXT_DRAW_OWNER.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut guard) = ACTIVE_DRAW.lock() {
-        *guard = active;
+        *guard = Some(ActiveDraw { owner, display });
+    }
+    owner
+}
+
+fn clear_active_draw(owner: u64) {
+    if let Ok(mut guard) = ACTIVE_DRAW.lock()
+        && guard.as_ref().is_some_and(|active| active.owner == owner)
+    {
+        *guard = None;
     }
 }
 
-fn current_active_draw() -> Option<ActiveDraw> {
-    ACTIVE_DRAW.lock().ok().and_then(|guard| guard.clone())
+fn current_active_draw() -> Option<DrawDisplay> {
+    ACTIVE_DRAW
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|active| active.display.clone()))
 }
 
 /// Run `f` with the active progress display suspended (bars cleared, draw
@@ -35,8 +58,8 @@ fn current_active_draw() -> Option<ActiveDraw> {
 /// which can overwrite the summary and leave a stale stacked frame behind.
 pub fn suspend_active_draw<T>(f: impl FnOnce() -> T) -> T {
     match current_active_draw() {
-        Some(ActiveDraw::Multi(multi)) => multi.suspend(f),
-        Some(ActiveDraw::Single(bar)) => bar.suspend(f),
+        Some(DrawDisplay::Multi(multi)) => multi.suspend(f),
+        Some(DrawDisplay::Single(bar)) => bar.suspend(f),
         None => f(),
     }
 }
@@ -65,8 +88,8 @@ impl Write for LogWriterHandle {
             Ok(written)
         };
         match current_active_draw() {
-            Some(ActiveDraw::Multi(multi)) => multi.suspend(write_all),
-            Some(ActiveDraw::Single(bar)) => bar.suspend(write_all),
+            Some(DrawDisplay::Multi(multi)) => multi.suspend(write_all),
+            Some(DrawDisplay::Single(bar)) => bar.suspend(write_all),
             None => write_all(),
         }
     }
@@ -78,17 +101,55 @@ impl Write for LogWriterHandle {
 
 #[derive(Clone)]
 pub struct ByteProgress {
+    inner: Arc<ByteProgressInner>,
+}
+
+struct ByteProgressInner {
     bar: Option<ProgressBar>,
+    owner: Option<u64>,
+    finished: AtomicBool,
+}
+
+impl ByteProgressInner {
+    fn finish(&self) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+        if let Some(owner) = self.owner {
+            clear_active_draw(owner);
+        }
+    }
+}
+
+impl Drop for ByteProgressInner {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl ByteProgress {
     pub fn new(total: Option<u64>, quiet: bool, label: &str) -> Self {
         if quiet || !std::io::stderr().is_terminal() {
-            return Self { bar: None };
+            return Self {
+                inner: Arc::new(ByteProgressInner {
+                    bar: None,
+                    owner: None,
+                    finished: AtomicBool::new(false),
+                }),
+            };
         }
 
         let Some(total) = total else {
-            return Self { bar: None };
+            return Self {
+                inner: Arc::new(ByteProgressInner {
+                    bar: None,
+                    owner: None,
+                    finished: AtomicBool::new(false),
+                }),
+            };
         };
 
         let bar = ProgressBar::new(total);
@@ -99,28 +160,31 @@ impl ByteProgress {
         .progress_chars("=> ");
         bar.set_style(style);
         bar.set_message(label.to_owned());
-        set_active_draw(Some(ActiveDraw::Single(bar.clone())));
+        let owner = set_active_draw(DrawDisplay::Single(bar.clone()));
 
-        Self { bar: Some(bar) }
+        Self {
+            inner: Arc::new(ByteProgressInner {
+                bar: Some(bar),
+                owner: Some(owner),
+                finished: AtomicBool::new(false),
+            }),
+        }
     }
 
     pub fn inc(&self, bytes: u64) {
-        if let Some(bar) = &self.bar {
+        if let Some(bar) = &self.inner.bar {
             bar.inc(bytes);
         }
     }
 
     pub fn set_position(&self, bytes: u64) {
-        if let Some(bar) = &self.bar {
+        if let Some(bar) = &self.inner.bar {
             bar.set_position(bytes);
         }
     }
 
     pub fn finish(&self) {
-        if let Some(bar) = &self.bar {
-            bar.finish_and_clear();
-            set_active_draw(None);
-        }
+        self.inner.finish();
     }
 }
 
@@ -137,7 +201,9 @@ pub struct SegmentedProgress {
 
 struct SegmentedProgressInner {
     bars: Option<SegmentedBars>,
-    positions: Mutex<SegmentPositions>,
+    owner: Option<u64>,
+    finished: AtomicBool,
+    positions: Option<Mutex<SegmentPositions>>,
     total: Option<u64>,
     segment_totals: Vec<u64>,
 }
@@ -146,12 +212,23 @@ impl Drop for SegmentedProgressInner {
     // Error paths drop the group without calling finish(); without this the
     // last frame stays on screen and every retry stacks a new copy below it.
     fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+impl SegmentedProgressInner {
+    fn finish(&self) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(bars) = &self.bars {
-            set_active_draw(None);
             for bar in &bars.segments {
                 bar.finish_and_clear();
             }
             bars.main.finish_and_clear();
+        }
+        if let Some(owner) = self.owner {
+            clear_active_draw(owner);
         }
     }
 }
@@ -220,12 +297,20 @@ impl SegmentedProgress {
             })
         };
 
+        let owner = bars
+            .as_ref()
+            .map(|bars| set_active_draw(DrawDisplay::Multi(bars._multi.clone())));
+        let track_positions = bars.is_some() || cfg!(test);
         Self {
             inner: Arc::new(SegmentedProgressInner {
                 bars,
-                positions: Mutex::new(SegmentPositions {
-                    main: main_position,
-                    segments: segment_positions,
+                owner,
+                finished: AtomicBool::new(false),
+                positions: track_positions.then(|| {
+                    Mutex::new(SegmentPositions {
+                        main: main_position,
+                        segments: segment_positions,
+                    })
                 }),
                 total,
                 segment_totals,
@@ -234,15 +319,14 @@ impl SegmentedProgress {
     }
 
     pub fn inc(&self, index: usize, bytes: u64) {
+        let Some(positions) = &self.inner.positions else {
+            return;
+        };
         let Some(segment_total) = self.inner.segment_totals.get(index).copied() else {
             debug_assert!(false, "missing segmented progress index {index}");
             return;
         };
-        let mut positions = self
-            .inner
-            .positions
-            .lock()
-            .expect("segmented progress mutex poisoned");
+        let mut positions = positions.lock().expect("segmented progress mutex poisoned");
         let Some(segment_position) = positions.segments.get_mut(index) else {
             debug_assert!(false, "missing segmented progress index {index}");
             return;
@@ -265,15 +349,14 @@ impl SegmentedProgress {
     }
 
     pub fn set_segment_position(&self, index: usize, bytes: u64) {
+        let Some(positions) = &self.inner.positions else {
+            return;
+        };
         let Some(segment_total) = self.inner.segment_totals.get(index).copied() else {
             debug_assert!(false, "missing segmented progress index {index}");
             return;
         };
-        let mut positions = self
-            .inner
-            .positions
-            .lock()
-            .expect("segmented progress mutex poisoned");
+        let mut positions = positions.lock().expect("segmented progress mutex poisoned");
         let position = bytes.min(segment_total);
         let Some(segment_position) = positions.segments.get_mut(index) else {
             debug_assert!(false, "missing segmented progress index {index}");
@@ -297,21 +380,15 @@ impl SegmentedProgress {
     }
 
     pub fn set_segment_message(&self, index: usize, message: String) {
-        if let Some(bars) = &self.inner.bars {
-            if let Some(bar) = bars.segments.get(index) {
-                bar.set_message(message);
-            }
+        if let Some(bars) = &self.inner.bars
+            && let Some(bar) = bars.segments.get(index)
+        {
+            bar.set_message(message);
         }
     }
 
     pub fn finish(&self) {
-        if let Some(bars) = &self.inner.bars {
-            set_active_draw(None);
-            for bar in &bars.segments {
-                bar.finish_and_clear();
-            }
-            bars.main.finish_and_clear();
-        }
+        self.inner.finish();
     }
 
     #[cfg(test)]
@@ -319,6 +396,8 @@ impl SegmentedProgress {
         let positions = self
             .inner
             .positions
+            .as_ref()
+            .expect("tests always track segmented positions")
             .lock()
             .expect("segmented progress mutex poisoned");
         (positions.main, positions.segments.clone())
@@ -373,7 +452,6 @@ fn segmented_bars(
         segments.push(bar);
     }
 
-    set_active_draw(Some(ActiveDraw::Multi(multi.clone())));
     SegmentedBars {
         _multi: multi,
         main,

@@ -1,13 +1,13 @@
 pkgbase = rgfile-bin
 	pkgdesc = Fast, robust command-line client for GigaFile.nu (prebuilt binary)
-	pkgver = 0.5.1
+	pkgver = 0.10.1
 	pkgrel = 1
 	url = https://github.com/Maymall/gigafile-rust-cli
 	arch = x86_64
 	license = MIT
 	provides = rgfile
 	conflicts = rgfile
-	source = https://github.com/Maymall/gigafile-rust-cli/releases/download/v0.5.1/rgfile-0.5.1-x86_64-unknown-linux-gnu.tar.gz
-	sha256sums = 332a1a1ab4ebbc9b5947ea306ed0154d21c0c0824fc8069fcd1d9fa294dbfa92
+	source = https://github.com/Maymall/gigafile-rust-cli/releases/download/v0.10.1/rgfile-0.10.1-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 552bc435ef15de811ae8c767023ed640b751bb652ad8aa0806af940984c4df32
 
 pkgname = rgfile-bin

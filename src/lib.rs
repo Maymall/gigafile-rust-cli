@@ -7,6 +7,7 @@ pub mod config;
 pub mod delete;
 pub mod download;
 pub mod error;
+mod fsutil;
 pub mod history;
 pub mod http;
 pub mod info;

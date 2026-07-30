@@ -7,7 +7,7 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{header, method, path, query_param},
 };
 
 const FILE_ID: &str = "0123abcd-000000example";
@@ -82,10 +82,16 @@ async fn cli_upload_verify_mismatch_exits_20() {
     mount_landing(&server).await;
     mount_upload(&server, Some(format!("{}/{FILE_ID}", server.uri()))).await;
     mount_download_page(&server).await;
-    Mock::given(method("HEAD"))
+    Mock::given(method("GET"))
         .and(path("/download.php"))
         .and(query_param("file", FILE_ID))
-        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "9"))
+        .and(header("Range", "bytes=0-0"))
+        .and(header("Accept-Encoding", "identity"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 0-0/9")
+                .set_body_bytes(b"x"),
+        )
         .mount(&server)
         .await;
     let temp = TempDir::new().unwrap();

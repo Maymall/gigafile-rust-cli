@@ -12,28 +12,33 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Maymall/gigafile-rust-cli/main/install.sh | sh   # Linux / macOS
-cargo install rgfile                                                                          # Rust 1.85+
+cargo install rgfile                                                                          # Rust 1.88+
 brew install Maymall/tap/rgfile                                                               # Homebrew
 ```
 
 Windows：`irm https://raw.githubusercontent.com/Maymall/gigafile-rust-cli/main/install.ps1 | iex`
 
-ビルド済みアーカイブと Debian パッケージは
-[リリースページ](https://github.com/Maymall/gigafile-rust-cli/releases/latest)にあります。
+ワンラインインストーラーは、選択したアーカイブをリリースの `SHA256SUMS`
+と照合してから展開します。`install.sh` は Linux x86_64（静的 musl）と
+macOS x86_64/arm64、`install.ps1` は Windows x86_64 に対応しています。
+[リリースページ](https://github.com/Maymall/gigafile-rust-cli/releases/latest)には、
+Linux x86_64 glibc のアーカイブと x86_64 Debian パッケージもあります。
+その他のアーキテクチャではソースからビルドできます。
 リリース版バイナリは `rgfile self-update` で自己更新できます。
 
 ## 使い方
 
 ```bash
 rgfile ul file.bin                   # アップロード。URL・削除キー・期限を表示
-rgfile ul file.bin --lifetime 7      # 保持期間 7 日（3–100）
+rgfile ul file.bin --lifetime 7      # 保持期間 7 日（3/5/7/14/30/60/100）
 
 rgfile dl <url>                      # ダウンロード。中断しても再実行で再開
 rgfile dl <url> --threads 8          # 複数コネクションの分割ダウンロード
 rgfile dl <url> --select 1,3-5       # まとめてページから選んで取得
 
 rgfile info <url>                    # ダウンロードせずにページ情報を確認
-rgfile delete <url>                  # 削除キーでアップロードを取り下げ
+rgfile delete <url>                  # 端末で削除キーを安全に入力
+rgfile delete <url> --delkey-file key.txt --yes
 rgfile parts list                    # 途中まで落とした .part の一覧
 rgfile parts clean --older-than 7    # 古い残骸を削除。実行中のものには触れない
 
@@ -42,7 +47,8 @@ rgfile history list                  # ローカル履歴（デフォルト無�
 rgfile completions zsh               # シェル補完
 ```
 
-すべてのコマンドで `--json` が使えます。詳細は `rgfile <コマンド> --help` へ。
+転送、情報、履歴一覧、parts の一覧/削除、設定表示、delete で `--json`
+を使用できます。JSON の削除には `--yes` も必要です。詳細は help へ。
 
 ## 設定
 
@@ -58,6 +64,11 @@ threads = 8                    # ファイルあたりの接続数、1–16
 [upload]
 lifetime = 7                   # 日数：3/5/7/14/30/60/100
 threads = 4                    # 先読みウィンドウ、1–16
+
+[network]
+timeout = 60                   # 読み取りのアイドル秒数、1–86400
+retries = 3                    # 再試行回数、0–20
+# user_agent = "rgfile/0.10.1"
 
 [history]
 enabled = true                 # デフォルトは無効
@@ -75,6 +86,8 @@ store_delete_keys = false      # 平文保存のため明示的に有効化
   削除キーとダウンロードパスワードはログに一切出ません。
 - アップロードはストリーミングでチャンクごとに再試行。チャンクの完了順は
   厳密に維持します（順不同だとサーバー側でデータが欠落することを実測で確認済み）。
+- アップロードの先読みメモリは約 512 MiB に制限され、チャンクが大きい場合は
+  ウィンドウを縮小するかストリーミングに切り替えます。
 - rgfile は GigaFile の制限回避・パスワード推測・リンク収集を行いません。
 
 ## 終了コード
@@ -85,7 +98,7 @@ store_delete_keys = false      # 平文保存のため明示的に有効化
 | 2 | 引数エラー |
 | 10 | GigaFile の URL ではない |
 | 11 | ネットワーク失敗（リトライ上限） |
-| 12 | 想定外の HTTP ステータス |
+| 12 | 想定外の HTTP ステータス、または制御レスポンスが大きすぎる |
 | 13 | ページを解析できない |
 | 14 | 存在しない・期限切れ |
 | 15 / 16 | ダウンロードキーが必要 / 不一致 |
@@ -98,6 +111,12 @@ store_delete_keys = false      # 平文保存のため明示的に有効化
 | 130 | 中断。残った `.part` は再実行で再開 |
 
 変更履歴：[CHANGELOG.md](CHANGELOG.md)
+
+履歴はデフォルトで無効です。有効にすると JSONL がシステムのデータディレクトリ
+（Linux では通常 `~/.local/share/rgfile/`）に保存されます。
+`history.store_delete_keys = true` を明示しない限り削除キーは保存されません。
+この設定を有効にした場合、削除キーは平文の資格情報として扱ってください。
+`history list --json` は保存済みの削除キーを出力しません。
 
 ## ライセンス
 

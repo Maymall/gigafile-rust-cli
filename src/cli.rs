@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    env,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Read as _},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(debug_assertions)]
+use std::env;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -16,8 +18,10 @@ use crate::{
     config, delete, download,
     error::{GfileError, IoOp},
     history::{self, HistoryOverride, HistoryRecord},
-    info, jsonout, parts, self_update, upload,
+    info, jsonout, naming, parts, self_update, upload,
 };
+
+const MAX_DELETE_KEY_FILE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -213,8 +217,12 @@ pub enum Commands {
         url: String,
 
         /// Upload delete key.
-        #[arg(long = "delkey", value_name = "KEY")]
+        #[arg(long = "delkey", value_name = "KEY", conflicts_with = "delkey_file")]
         delkey: Option<String>,
+
+        /// Read the upload delete key from a file.
+        #[arg(long = "delkey-file", value_name = "PATH")]
+        delkey_file: Option<PathBuf>,
 
         /// Skip the interactive confirmation prompt.
         #[arg(long = "yes")]
@@ -299,6 +307,10 @@ pub enum PartsCommands {
         /// Skip the interactive confirmation prompt.
         #[arg(long = "yes")]
         yes: bool,
+
+        /// Print one JSON object.
+        #[arg(long = "json")]
+        json: bool,
     },
 }
 
@@ -346,6 +358,29 @@ pub enum RunOutcome {
     Failure(u8),
 }
 
+impl Cli {
+    pub fn wants_json(&self) -> bool {
+        match &self.command {
+            Commands::Download { json, .. }
+            | Commands::Info { json, .. }
+            | Commands::Upload { json, .. }
+            | Commands::Delete { json, .. } => *json,
+            Commands::Parts { command } => match command {
+                PartsCommands::List { json, .. } | PartsCommands::Clean { json, .. } => *json,
+            },
+            Commands::History { command } => match command {
+                HistoryCommands::List { json, .. } => *json,
+                HistoryCommands::Clear => false,
+            },
+            Commands::Config { command } => match command {
+                ConfigCommands::Show { json } => *json,
+                ConfigCommands::Path | ConfigCommands::Init { .. } => false,
+            },
+            Commands::SelfUpdate | Commands::Completions { .. } => false,
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
     let Cli {
         verbose: _,
@@ -355,6 +390,35 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
         no_history,
         command,
     } = cli;
+    if let Commands::Completions { shell } = &command {
+        let mut command = Cli::command();
+        clap_complete::generate(*shell, &mut command, "rgfile", &mut io::stdout());
+        return Ok(RunOutcome::Success);
+    }
+    if matches!(command, Commands::SelfUpdate) {
+        match self_update::self_update(self_update::SelfUpdateOptions {
+            base_url: self_update_base_url(),
+            force: self_update_force(),
+        })
+        .await?
+        {
+            self_update::SelfUpdateReport::AlreadyUpToDate { version } => {
+                println!("rgfile {version} is already up to date");
+            }
+            self_update::SelfUpdateReport::Updated {
+                old_version,
+                new_version,
+                target,
+                path,
+            } => {
+                println!(
+                    "updated rgfile {old_version} -> {new_version} ({target}) at {}",
+                    human_path(&path)
+                );
+            }
+        }
+        return Ok(RunOutcome::Success);
+    }
     match command {
         Commands::Config { command } => {
             run_config_command(command, config_path.as_deref(), no_config)
@@ -399,8 +463,8 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         force,
                         no_resume,
                         threads,
-                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
-                        retries: config.resolve_retries(retries),
+                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)?),
+                        retries: config.resolve_retries(retries)?,
                         user_agent: config.resolve_user_agent(user_agent),
                         dump_page,
                         quiet: quiet || json,
@@ -457,8 +521,8 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                 } => {
                     let result = info::info(info::InfoOptions {
                         url,
-                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
-                        retries: config.resolve_retries(retries),
+                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)?),
+                        retries: config.resolve_retries(retries)?,
                         user_agent: config.resolve_user_agent(user_agent),
                         dump_page,
                         allow_any_host: test_allow_any_host(),
@@ -502,8 +566,8 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         chunk_size: upload::parse_chunk_size(&chunk_size)?,
                         threads: config.resolve_upload_threads(threads)?,
                         verify: !no_verify,
-                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
-                        retries: config.resolve_retries(retries),
+                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)?),
+                        retries: config.resolve_retries(retries)?,
                         user_agent: config.resolve_user_agent(user_agent),
                         dump_page,
                         quiet: quiet || json,
@@ -548,33 +612,34 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                 Commands::Delete {
                     url,
                     delkey,
+                    delkey_file,
                     yes,
                     timeout,
                     retries,
                     user_agent,
                     json,
                 } => {
-                    let history_match = find_delete_key_in_history(&history_settings, &url)?;
+                    let file_delkey = delkey_file
+                        .as_deref()
+                        .map(read_delete_key_file)
+                        .transpose()?;
+                    let explicit_delkey = delkey.or(file_delkey);
+                    // An explicitly supplied key must remain usable even if an
+                    // old history file is truncated or otherwise corrupt. Only
+                    // consult history when there is no explicit credential.
+                    let history_match = if explicit_delkey.is_none() {
+                        find_delete_key_in_history(&history_settings, &url)?
+                    } else {
+                        None
+                    };
                     let history_files = history_match
                         .as_ref()
                         .map(|record| record.files.clone())
                         .unwrap_or_default();
-                    let resolved_delkey = match delkey
+                    let resolved_delkey = explicit_delkey
                         .or_else(|| history_match.and_then(|record| record.delete_key))
-                    {
-                        Some(delkey) => delkey,
-                        None => {
-                            let error = GfileError::Usage {
-                                message: "delete key required; pass --delkey KEY, or enable history.store_delete_keys before uploading so rgfile can find it later".to_owned(),
-                            };
-                            if json {
-                                let code = error.exit_code();
-                                jsonout::print_error(&error)?;
-                                return Ok(RunOutcome::Failure(code));
-                            }
-                            return Err(error);
-                        }
-                    };
+                        .map(Ok)
+                        .unwrap_or_else(prompt_or_require_delete_key)?;
 
                     if !yes {
                         confirm_delete_interactive(
@@ -586,8 +651,8 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                     let result = delete::delete(delete::DeleteOptions {
                         url: url.clone(),
                         delkey: resolved_delkey,
-                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)),
-                        retries: config.resolve_retries(retries),
+                        timeout: Duration::from_secs(config.resolve_timeout_secs(timeout)?),
+                        retries: config.resolve_retries(retries)?,
                         user_agent: config.resolve_user_agent(user_agent),
                         allow_any_host: test_allow_any_host(),
                     })
@@ -601,7 +666,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                                     url: &report.url,
                                 })?;
                             } else {
-                                println!("deleted {}", report.url);
+                                println!("deleted {}", human_text(&report.url));
                             }
                             record_delete_history(
                                 &history_settings,
@@ -649,6 +714,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         dir,
                         older_than,
                         yes,
+                        json,
                     } => {
                         let dir = resolve_parts_dir(&config, dir)?;
                         let report = parts::list(dir.clone())?;
@@ -657,8 +723,13 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         let active_count =
                             report.groups.iter().filter(|group| group.active).count();
                         if candidates.is_empty() {
-                            println!("nothing to clean");
-                            if active_count > 0 {
+                            if json {
+                                let clean_report = parts::clean(dir, &report.groups, older_than)?;
+                                jsonout::print_json(&clean_report)?;
+                            } else {
+                                println!("nothing to clean");
+                            }
+                            if active_count > 0 && !json {
                                 eprintln!(
                                     "Skipped {active_count} active partial download group(s)."
                                 );
@@ -666,21 +737,34 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                             return Ok(RunOutcome::Success);
                         }
                         if !yes {
+                            if json {
+                                return Err(GfileError::Usage {
+                                    message: "parts clean --json requires --yes in non-interactive output"
+                                        .to_owned(),
+                                });
+                            }
                             confirm_parts_clean_interactive(&candidates)?;
                         }
                         let clean_report = parts::clean(dir, &report.groups, older_than)?;
-                        print_human_parts_clean(&clean_report);
-                        Ok(RunOutcome::Success)
+                        if json {
+                            jsonout::print_json(&clean_report)?;
+                        } else {
+                            print_human_parts_clean(&clean_report);
+                        }
+                        if clean_report.failed.is_empty() {
+                            Ok(RunOutcome::Success)
+                        } else {
+                            Ok(RunOutcome::Failure(18))
+                        }
                     }
                 },
                 Commands::History { command } => match command {
                     HistoryCommands::List { json, limit } => {
-                        let records =
-                            history::latest(history::read(&history_settings.path)?, limit);
+                        let records = history::read_latest(&history_settings.path, limit)?;
                         if json {
                             jsonout::print_json(&HistoryListJson {
                                 status: "ok",
-                                entries: &records,
+                                entries: records.iter().map(history_entry_json).collect(),
                             })?;
                         } else {
                             print_human_history(&records);
@@ -711,7 +795,7 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
                         } => {
                             println!(
                                 "updated rgfile {old_version} -> {new_version} ({target}) at {}",
-                                path.display()
+                                human_path(&path)
                             );
                         }
                     }
@@ -733,13 +817,34 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, GfileError> {
 #[derive(Debug, Serialize)]
 struct HistoryListJson<'a> {
     status: &'static str,
-    entries: &'a [HistoryRecord],
+    entries: Vec<HistoryEntryJson<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryEntryJson<'a> {
+    timestamp: &'a str,
+    operation: history::HistoryOperation,
+    page_url: &'a str,
+    files: &'a [String],
+    bytes: Option<u64>,
+    result: &'a str,
 }
 
 #[derive(Debug, Serialize)]
 struct DeleteReportJson<'a> {
     status: &'static str,
     url: &'a str,
+}
+
+fn history_entry_json(record: &HistoryRecord) -> HistoryEntryJson<'_> {
+    HistoryEntryJson {
+        timestamp: &record.timestamp,
+        operation: record.operation,
+        page_url: &record.page_url,
+        files: &record.files,
+        bytes: record.bytes,
+        result: &record.result,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -798,7 +903,7 @@ fn run_config_command(
     match command {
         ConfigCommands::Path => {
             let path = config::resolved_config_path(config_path)?;
-            println!("{}", path.display());
+            println!("{}", human_path(&path));
             if !path.exists() {
                 eprintln!("file does not exist yet");
             }
@@ -818,8 +923,9 @@ fn run_config_command(
         }
         ConfigCommands::Init { defaults, force } => {
             let path = config::resolved_config_path(config_path)?;
+            let existed = path.exists();
             let text = if defaults {
-                if path.exists() && !force {
+                if existed && !force {
                     return Err(GfileError::Usage {
                         message: format!(
                             "config file already exists at {}; pass --force to overwrite",
@@ -838,9 +944,7 @@ fn run_config_command(
                 }
                 let mut stdin = io::stdin().lock();
                 let mut stderr = io::stderr().lock();
-                if path.exists()
-                    && !force
-                    && !config::confirm_overwrite(&mut stdin, &mut stderr, &path)?
+                if existed && !force && !config::confirm_overwrite(&mut stdin, &mut stderr, &path)?
                 {
                     return Err(GfileError::Usage {
                         message: "config init aborted; existing file was not overwritten"
@@ -849,33 +953,21 @@ fn run_config_command(
                 }
                 config::run_init_wizard(&mut stdin, &mut stderr)?
             };
-            write_config_file(&path, &text)?;
-            println!("{}", path.display());
+            config::write_config_file(&path, &text, force || existed)?;
+            println!("{}", human_path(&path));
             eprintln!("Wrote config. Run `rgfile config show` to inspect it.");
             Ok(RunOutcome::Success)
         }
     }
 }
 
-fn write_config_file(path: &Path, text: &str) -> Result<(), GfileError> {
-    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|source| GfileError::Io {
-            source,
-            path: parent.to_owned(),
-            op: IoOp::Create,
-        })?;
-    }
-    std::fs::write(path, text).map_err(|source| GfileError::Io {
-        source,
-        path: path.to_owned(),
-        op: IoOp::Write,
-    })
-}
-
 fn print_human_config_show(inspection: &config::ConfigInspection) {
-    println!("source: {}", config_show_source_description(inspection));
+    println!(
+        "source: {}",
+        human_text(&config_show_source_description(inspection))
+    );
     if let Some(path) = &inspection.path {
-        println!("path: {}", path.display());
+        println!("path: {}", human_path(path));
     }
     println!("exists: {}", inspection.exists);
     print_config_value(
@@ -885,7 +977,7 @@ fn print_human_config_show(inspection: &config::ConfigInspection) {
             .download
             .dir
             .as_ref()
-            .map(|path| path.display().to_string()),
+            .map(|path| human_path(path)),
         inspection.source_download_dir(),
     );
     print_config_value(
@@ -905,12 +997,12 @@ fn print_human_config_show(inspection: &config::ConfigInspection) {
     );
     print_config_value(
         "network.timeout",
-        Some(inspection.config.resolve_timeout_secs(None)),
+        Some(inspection.config.resolve_timeout_secs(None).unwrap()),
         inspection.source_network_timeout(),
     );
     print_config_value(
         "network.retries",
-        Some(inspection.config.resolve_retries(None)),
+        Some(inspection.config.resolve_retries(None).unwrap()),
         inspection.source_network_retries(),
     );
     print_config_value(
@@ -936,7 +1028,11 @@ fn print_config_value<T: std::fmt::Display>(
     source: config::ConfigValueSource,
 ) {
     match value {
-        Some(value) => println!("{key} = {value} ({})", source.as_str()),
+        Some(value) => println!(
+            "{key} = {} ({})",
+            human_text(&value.to_string()),
+            source.as_str()
+        ),
         None => println!("{key} = <unset> ({})", source.as_str()),
     }
 }
@@ -978,11 +1074,11 @@ fn config_show_json(inspection: &config::ConfigInspection) -> ConfigShowJson {
             },
             network: ConfigNetworkJson {
                 timeout: config_value(
-                    Some(inspection.config.resolve_timeout_secs(None)),
+                    Some(inspection.config.resolve_timeout_secs(None).unwrap()),
                     inspection.source_network_timeout(),
                 ),
                 retries: config_value(
-                    Some(inspection.config.resolve_retries(None)),
+                    Some(inspection.config.resolve_retries(None).unwrap()),
                     inspection.source_network_retries(),
                 ),
                 user_agent: config_value(
@@ -1167,12 +1263,11 @@ fn find_delete_key_in_history(
     if !settings.enabled || !settings.store_delete_keys {
         return Ok(None);
     }
-    let records = history::read(&settings.path)?;
-    Ok(records.into_iter().rev().find(|record| {
+    history::read_latest_matching(&settings.path, |record| {
         record.operation == history::HistoryOperation::Upload
             && record.page_url == url
             && record.delete_key.is_some()
-    }))
+    })
 }
 
 fn record_delete_history(
@@ -1193,9 +1288,9 @@ fn confirm_delete_interactive(url: &str, filename: Option<&str>) -> Result<(), G
     }
     eprintln!("Delete shared file:");
     if let Some(filename) = filename {
-        eprintln!("  file: {filename}");
+        eprintln!("  file: {}", human_text(filename));
     }
-    eprintln!("  url: {url}");
+    eprintln!("  url: {}", human_text(url));
     eprint!("Proceed? [y/N]: ");
 
     let mut answer = String::new();
@@ -1214,6 +1309,49 @@ fn confirm_delete_interactive(url: &str, filename: Option<&str>) -> Result<(), G
     }
 }
 
+fn read_delete_key_file(path: &Path) -> Result<String, GfileError> {
+    let file = std::fs::File::open(path).map_err(|source| GfileError::Io {
+        source,
+        path: path.to_owned(),
+        op: IoOp::Read,
+    })?;
+    let mut bytes = Vec::with_capacity(MAX_DELETE_KEY_FILE_BYTES + 1);
+    file.take((MAX_DELETE_KEY_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| GfileError::Io {
+            source,
+            path: path.to_owned(),
+            op: IoOp::Read,
+        })?;
+    if bytes.len() > MAX_DELETE_KEY_FILE_BYTES {
+        return Err(GfileError::Usage {
+            message: format!(
+                "delete key file exceeds the {MAX_DELETE_KEY_FILE_BYTES}-byte safety limit"
+            ),
+        });
+    }
+    let value = String::from_utf8(bytes).map_err(|source| GfileError::Io {
+        source: io::Error::new(io::ErrorKind::InvalidData, source),
+        path: path.to_owned(),
+        op: IoOp::Read,
+    })?;
+    Ok(value.trim().to_owned())
+}
+
+fn prompt_or_require_delete_key() -> Result<String, GfileError> {
+    if !io::stdin().is_terminal() {
+        return Err(GfileError::Usage {
+            message: "delete key required; pass --delkey KEY, --delkey-file PATH, or enable history.store_delete_keys before uploading"
+                .to_owned(),
+        });
+    }
+    rpassword::prompt_password("Delete key: ").map_err(|source| GfileError::Io {
+        source,
+        path: PathBuf::from("<stdin>"),
+        op: IoOp::Read,
+    })
+}
+
 fn confirm_parts_clean_interactive(candidates: &[parts::PartGroup]) -> Result<(), GfileError> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err(GfileError::Usage {
@@ -1222,7 +1360,7 @@ fn confirm_parts_clean_interactive(candidates: &[parts::PartGroup]) -> Result<()
     }
     eprintln!("Partial download groups to delete:");
     for group in candidates {
-        eprintln!("  {}", group.target_name);
+        eprintln!("  {}", human_text(&group.target_name));
     }
     eprint!("Proceed? [y/N]: ");
     let mut answer = String::new();
@@ -1271,16 +1409,16 @@ fn local_file_size(path: &Path) -> Option<u64> {
 fn print_human_download_report(report: &download::DownloadReport) {
     if report.kind == crate::parser::download::PageKind::Single {
         if let Some(path) = report.files.first().and_then(|file| file.path.as_ref()) {
-            println!("{}", path.display());
+            println!("{}", human_path(path));
         }
         return;
     }
 
     for file in &report.files {
         match (&file.path, &file.error) {
-            (Some(path), None) => println!("ok\t{}\t{}", file.name, path.display()),
-            (_, Some(error)) => println!("error\t{}\t{}", file.name, error.code),
-            _ => println!("error\t{}\tunknown", file.name),
+            (Some(path), None) => println!("ok\t{}\t{}", human_text(&file.name), human_path(path)),
+            (_, Some(error)) => println!("error\t{}\t{}", human_text(&file.name), error.code),
+            _ => println!("error\t{}\tunknown", human_text(&file.name)),
         }
     }
 }
@@ -1291,10 +1429,11 @@ fn print_human_info_report(report: &info::InfoReport) {
     for file in &report.files {
         println!(
             "[{}]\tdisplay_name (may be masked)\t{}",
-            file.index, file.display_name
+            file.index,
+            human_text(&file.display_name)
         );
         if let Some(size) = &file.display_size {
-            println!("display_size\t{size}");
+            println!("display_size\t{}", human_text(size));
         }
         if let Some(bytes) = file.approx_bytes {
             println!("approx_bytes\t{bytes}");
@@ -1303,15 +1442,15 @@ fn print_human_info_report(report: &info::InfoReport) {
 }
 
 fn print_human_upload_report(report: &upload::UploadReport) {
-    println!("{}", report.url);
+    println!("{}", human_text(&report.url));
     if let Some(delkey) = &report.delkey {
-        println!("delete key: {delkey}");
+        println!("delete key: {}", human_text(delkey));
     }
     if let Some(expires_at) = &report.expires_at_estimate {
-        println!("expires: {expires_at}");
+        println!("expires: {}", human_text(expires_at));
     }
     if let Some(filename) = &report.remote_filename {
-        println!("remote name: {filename}");
+        println!("remote name: {}", human_text(filename));
     }
     if report.delkey.is_some() {
         // Printed after the whole stdout block so it never lands between the
@@ -1326,14 +1465,14 @@ fn print_human_upload_report(report: &upload::UploadReport) {
 }
 
 fn print_human_parts_list(report: &parts::PartsReport) {
-    println!("dir\t{}", report.dir.display());
+    println!("dir\t{}", human_path(&report.dir));
     println!(
         "target\tstate\tactive\tdisk_bytes\tcompleted_bytes\texpected_bytes\tprogress\tmtime_unix"
     );
     for group in &report.groups {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            group.target_name,
+            human_text(&group.target_name),
             part_state_name(group.state),
             group.active,
             group.disk_bytes,
@@ -1347,20 +1486,20 @@ fn print_human_parts_list(report: &parts::PartsReport) {
 
 fn print_human_parts_clean(report: &parts::CleanReport) {
     for group in &report.deleted {
-        println!("deleted\t{}", group.target_name);
+        println!("deleted\t{}", human_text(&group.target_name));
         for path in &group.paths {
-            println!("removed\t{}", path.display());
+            println!("removed\t{}", human_path(path));
         }
     }
     for group in &report.skipped_active {
-        eprintln!("skipped active\t{}", group.target_name);
+        eprintln!("skipped active\t{}", human_text(&group.target_name));
     }
     for failure in &report.failed {
         eprintln!(
             "failed\t{}\t{}\t{}",
-            failure.target_name,
-            failure.path.display(),
-            failure.message
+            human_text(&failure.target_name),
+            human_path(&failure.path),
+            human_text(&failure.message)
         );
     }
     println!(
@@ -1407,18 +1546,31 @@ fn print_human_history(records: &[HistoryRecord]) {
         let files = if record.files.is_empty() {
             "-".to_owned()
         } else {
-            record.files.join(",")
+            human_text(&record.files.join(",")).into_owned()
         };
         let url = if record.page_url.is_empty() {
-            "-"
+            "-".to_owned()
         } else {
-            &record.page_url
+            human_text(&record.page_url).into_owned()
         };
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}",
-            record.timestamp, operation, record.result, bytes, files, url
+            human_text(&record.timestamp),
+            operation,
+            human_text(&record.result),
+            bytes,
+            files,
+            url
         );
     }
+}
+
+fn human_text(value: &str) -> std::borrow::Cow<'_, str> {
+    naming::escape_terminal_text(value)
+}
+
+fn human_path(path: &Path) -> String {
+    human_text(&path.to_string_lossy()).into_owned()
 }
 
 fn page_kind_name(kind: crate::parser::download::PageKind) -> &'static str {
@@ -1429,17 +1581,79 @@ fn page_kind_name(kind: crate::parser::download::PageKind) -> &'static str {
 }
 
 fn test_allow_any_host() -> bool {
-    env::var("GFILE_TEST_ALLOW_ANY_HOST").as_deref() == Ok("1")
+    #[cfg(debug_assertions)]
+    {
+        env::var("GFILE_TEST_ALLOW_ANY_HOST").as_deref() == Ok("1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 fn upload_entry_url() -> String {
-    env::var("GFILE_TEST_ENTRY_URL").unwrap_or_else(|_| upload::default_entry_url().to_owned())
+    #[cfg(debug_assertions)]
+    {
+        env::var("GFILE_TEST_ENTRY_URL").unwrap_or_else(|_| upload::default_entry_url().to_owned())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        upload::default_entry_url().to_owned()
+    }
 }
 
 fn self_update_base_url() -> Option<String> {
-    env::var("RGFILE_TEST_UPDATE_BASE_URL").ok()
+    #[cfg(debug_assertions)]
+    {
+        env::var("RGFILE_TEST_UPDATE_BASE_URL").ok()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 fn self_update_force() -> bool {
-    env::var("RGFILE_TEST_FORCE_UPDATE").as_deref() == Ok("1")
+    #[cfg(debug_assertions)]
+    {
+        env::var("RGFILE_TEST_FORCE_UPDATE").as_deref() == Ok("1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_key_file_is_trimmed_and_size_limited() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("delete-key.txt");
+        std::fs::write(&path, b"  secret-key\r\n").unwrap();
+
+        assert_eq!(read_delete_key_file(&path).unwrap(), "secret-key");
+
+        std::fs::write(&path, vec![b'x'; MAX_DELETE_KEY_FILE_BYTES + 1]).unwrap();
+        let error = read_delete_key_file(&path).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .user_message()
+                .contains("delete key file exceeds the 4096-byte safety limit")
+        );
+    }
+
+    #[test]
+    fn delete_key_file_must_be_utf8() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("delete-key.txt");
+        std::fs::write(&path, [0xff]).unwrap();
+
+        let error = read_delete_key_file(&path).unwrap_err();
+
+        assert_eq!(error.exit_code(), 18);
+    }
 }
