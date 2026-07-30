@@ -68,7 +68,7 @@ threads = 4                    # 先読みウィンドウ、1–16
 [network]
 timeout = 60                   # 読み取りのアイドル秒数、1–86400
 retries = 3                    # 再試行回数、0–20
-# user_agent = "rgfile/0.10.1"
+# user_agent = "rgfile/0.11.0"
 
 [history]
 enabled = true                 # デフォルトは無効

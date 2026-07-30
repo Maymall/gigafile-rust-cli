@@ -7,6 +7,8 @@ Versioning.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-30
+
 ### Added
 
 - Add bounded response readers, retry handling for rate limits, strict URL and

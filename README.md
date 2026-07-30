@@ -69,7 +69,7 @@ threads = 4                    # read-ahead chunk window, 1–16
 [network]
 timeout = 60                   # idle seconds per request/read, 1–86400
 retries = 3                    # retryable failures, 0–20
-# user_agent = "rgfile/0.10.1"
+# user_agent = "rgfile/0.11.0"
 
 [history]
 enabled = true                 # off by default

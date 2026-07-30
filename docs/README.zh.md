@@ -67,7 +67,7 @@ threads = 4                    # 预读窗口，1–16
 [network]
 timeout = 60                   # 每次读取的空闲秒数，1–86400
 retries = 3                    # 可重试失败次数，0–20
-# user_agent = "rgfile/0.10.1"
+# user_agent = "rgfile/0.11.0"
 
 [history]
 enabled = true                 # 默认关闭
